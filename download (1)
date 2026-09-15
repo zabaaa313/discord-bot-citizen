@@ -1,0 +1,16 @@
+# Normalizacja końcówek linii między systemami (Windows/Linux)
+* text=auto
+
+# Skrypty i źródła zawsze LF (ważne dla Dockera na VPS)
+*.js text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+Dockerfile text eol=lf
+.env.example text eol=lf
+
+# Pliki binarne
+*.zip binary
+*.png binary
+*.jpg binary

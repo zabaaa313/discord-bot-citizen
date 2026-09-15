@@ -1,0 +1,33 @@
+# --- Zależności ---
+node_modules/
+
+# --- Sekrety i konfiguracja (NIGDY nie wrzucamy!) ---
+.env
+.env.local
+.env.*.local
+
+# --- Dane generowane przez bota ---
+workspaces/
+downloads/
+
+# --- Logi ---
+*.log
+npm-debug.log*
+logs/
+
+# --- Artefakty paczek ---
+*.zip
+*.tar.gz
+
+# --- System / edytory / narzędzia lokalne ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+.freebuff/
+
+# --- Klucze deployowe (gdyby ktoś wygenerował je w folderze projektu) ---
+deploy_key
+deploy_key.pub
+*.pem
