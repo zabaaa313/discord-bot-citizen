@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import html
 import json
 import logging
@@ -28,9 +29,12 @@ import os
 import random
 import re
 import shutil
+import sys
 import time
+import traceback
 import zipfile
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -65,15 +69,31 @@ MAX_DOWNLOAD_MB = int(os.getenv("MAX_DOWNLOAD_MB", "200") or 200)
 MAX_DOWNLOAD_BYTES = MAX_DOWNLOAD_MB * 1024 * 1024
 DEFAULT_BUILD_ID = os.getenv("GAME_BUILD", "latest").strip() or "latest"
 
+# --- Cache plikow bazowych (paczki buduja sie w ulamku sekundy) ---
+CACHE_ENABLED = os.getenv("CACHE_ENABLED", "1").strip().lower() not in ("0", "false", "no")
+CACHE_TTL_HOURS = int(os.getenv("CACHE_TTL_HOURS", "72") or 72)
+# --- Garbage Collector (auto-czyszczenie dysku) ---
+DELETE_AFTER_DOWNLOAD_MINUTES = int(os.getenv("DELETE_AFTER_DOWNLOAD_MINUTES", "10") or 10)
+GC_INTERVAL_MINUTES = int(os.getenv("GC_INTERVAL_MINUTES", "2") or 2)
+# --- Powiadomienia o bledach (webhook Discorda) ---
+ERROR_WEBHOOK_URL = os.getenv("ERROR_WEBHOOK_URL", "").strip()
+# --- Kolejka: informuj gracza o pozycji w kolejce ---
+QUEUE_NOTIFY = os.getenv("QUEUE_NOTIFY", "1").strip().lower() not in ("0", "false", "no")
+# --- Paginacja (Discord limituje select do 25 opcji) ---
+SKINS_PER_PAGE = max(5, int(os.getenv("SKINS_PER_PAGE", "24") or 24))
+SEARCH_RESULTS_PER_PAGE = max(3, int(os.getenv("SEARCH_RESULTS_PER_PAGE", "8") or 8))
+STEPS_PER_PAGE = max(5, int(os.getenv("STEPS_PER_PAGE", "24") or 24))
+
 ROOT = Path(__file__).parent.resolve()
 DOWNLOADS_DIR = ROOT / "downloads"
 WORKSPACES_DIR = ROOT / "temp_sessions"
 LOGS_DIR = ROOT / "logs"
 DATA_DIR = ROOT / "data"
+CACHE_DIR = ROOT / "cache"
 POSTED_FILE = ROOT / "posted_videos.json"
 BUILD_STATE_FILE = DATA_DIR / "build.json"
 
-for _d in (DOWNLOADS_DIR, WORKSPACES_DIR, LOGS_DIR, DATA_DIR):
+for _d in (DOWNLOADS_DIR, WORKSPACES_DIR, LOGS_DIR, DATA_DIR, CACHE_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
 # --- Nazwy rol / kategorii / kanalow ---
@@ -602,6 +622,131 @@ Link wygasa automatycznie razem z paczką ({DOWNLOAD_TTL_MINUTES} min od wygener
 </body></html>"""
 
 # ============================================================================
+# 9.5. CACHE PLIKÓW BAZOWYCH (mniej pobierania = szybsze paczki)
+# ============================================================================
+
+cache_log = log("FileCache")
+
+
+class FileCache:
+    """
+    Lokalny cache czystych plików bazowych.
+
+    Zamiast pobierać ten sam mod z internetu przy każdej paczce, bot zapisuje
+    go raz w folderze `cache/` i przy kolejnych zamówieniach kopiuje lokalnie
+    (dziesiątki razy szybciej niż pobieranie z sieci).
+
+    Klucz cache = SHA-1 z adresu URL, więc zmiana linku w konfiguracji sama
+    unieważnia stary wpis. Wpisy starsze niż CACHE_TTL_HOURS są usuwane.
+    """
+
+    def __init__(self, directory: Path) -> None:
+        self.directory = directory
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.hits = 0
+        self.misses = 0
+
+    @staticmethod
+    def key(url: str) -> str:
+        """Klucz cache dla adresu URL."""
+        return hashlib.sha1((url or "").encode("utf-8")).hexdigest()
+
+    def path_for(self, url: str) -> Path:
+        """Ścieżka pliku w cache (z zachowaniem rozszerzenia)."""
+        extension = Path(urlparse(url).path).suffix.lower() or ".bin"
+        return self.directory / f"{self.key(url)}{extension}"
+
+    def lookup(self, url: str) -> Optional[Path]:
+        """Zwraca ścieżkę z cache (albo None, gdy trzeba pobrać z sieci)."""
+        if not CACHE_ENABLED:
+            return None
+        path = self.path_for(url)
+        try:
+            if not path.exists():
+                self.misses += 1
+                return None
+            age_hours = (time.time() - path.stat().st_mtime) / 3600
+            if age_hours > CACHE_TTL_HOURS:
+                path.unlink(missing_ok=True)
+                self.misses += 1
+                return None
+        except OSError:
+            self.misses += 1
+            return None
+        self.hits += 1
+        return path
+
+    def store(self, url: str, source: Path) -> Optional[Path]:
+        """Zapisuje pobrany plik do cache."""
+        if not CACHE_ENABLED:
+            return None
+        target = self.path_for(url)
+        try:
+            if target.exists() and target.resolve() == Path(source).resolve():
+                return target
+            shutil.copyfile(source, target)
+            cache_log.info("Cache: zapisano %s (%.1f KB)", target.name,
+                           target.stat().st_size / 1024)
+            return target
+        except OSError as exc:
+            cache_log.warning("Nie zapisano do cache: %s", exc)
+            return None
+
+    def files(self) -> List[Path]:
+        """Pliki w cache."""
+        return [p for p in self.directory.glob("*") if p.is_file()]
+
+    def size_bytes(self) -> int:
+        """Rozmiar cache w bajtach."""
+        total = 0
+        for path in self.files():
+            try:
+                total += path.stat().st_size
+            except OSError:
+                continue
+        return total
+
+    def sweep(self) -> int:
+        """Usuwa przeterminowane wpisy. Zwraca liczbę zwolnionych bajtów."""
+        freed = 0
+        for path in self.files():
+            try:
+                if time.time() - path.stat().st_mtime > CACHE_TTL_HOURS * 3600:
+                    freed += path.stat().st_size
+                    path.unlink(missing_ok=True)
+            except OSError:
+                continue
+        if freed:
+            cache_log.info("Cache: zwolniono %.1f MB", freed / 1024 / 1024)
+        return freed
+
+    def clear(self) -> int:
+        """Czyści cały cache. Zwraca zwolnione bajty."""
+        freed = 0
+        for path in self.files():
+            try:
+                freed += path.stat().st_size
+                path.unlink(missing_ok=True)
+            except OSError:
+                continue
+        return freed
+
+    def stats(self) -> Dict[str, Any]:
+        """Statystyki cache (do /status)."""
+        return {
+            "enabled": CACHE_ENABLED,
+            "files": len(self.files()),
+            "bytes": self.size_bytes(),
+            "hits": self.hits,
+            "misses": self.misses,
+            "ttl_hours": CACHE_TTL_HOURS,
+        }
+
+
+FILE_CACHE = FileCache(CACHE_DIR)
+
+
+# ============================================================================
 # 10. STORAGE — paczki ZIP i podglądy (TTL + auto-sprzątanie)
 # ============================================================================
 
@@ -613,42 +758,94 @@ def new_token() -> str:
     return os.urandom(16).hex()
 
 
+def directory_size_bytes(directory: Path) -> int:
+    """Rozmiar katalogu w bajtach (rekurencyjnie, odporne na bledy IO)."""
+    total = 0
+    if not directory.exists():
+        return 0
+    for path in directory.rglob("*"):
+        try:
+            if path.is_file():
+                total += path.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
 class Storage:
-    """Magazyn paczek ZIP i podglądów HTML z automatycznym wygasaniem."""
+    """
+    Magazyn paczek ZIP i podglądów HTML z automatycznym wygasaniem
+    oraz Garbage Collectorem (auto-czyszczenie dysku).
+
+    Cykl życia paczki:
+      1. wygenerowana -> link ważny DOWNLOAD_TTL_MINUTES,
+      2. pobrana przez gracza -> usuwana DELETE_AFTER_DOWNLOAD_MINUTES po pobraniu,
+      3. kanał sesji zamknięty -> natychmiastowe usunięcie paczek użytkownika,
+      4. wygasła bez pobrania -> usuwana przez GC.
+    """
 
     def __init__(self) -> None:
         self.packages: Dict[str, Dict[str, Any]] = {}
         self.previews: Dict[str, Dict[str, Any]] = {}
+        self.gc_runs = 0
+        self.freed_bytes = 0
+        self.deleted_packages = 0
 
     # --- paczki ---
     def register(self, file_path: Path, file_name: str, size: int, file_count: int,
-                 user_id: str, workspace: Optional[Path] = None) -> str:
+                 user_id: int, workspace: Optional[Path] = None) -> str:
         token = new_token()
         self.packages[token] = {
             "file_path": Path(file_path), "file_name": file_name, "size": size,
             "file_count": file_count, "user_id": user_id,
             "workspace": Path(workspace) if workspace else None,
-            "created_at": time.time(),
+            "created_at": time.time(), "downloaded_at": None, "downloads": 0,
         }
         return token
 
     def get(self, token: str) -> Optional[Dict[str, Any]]:
         return self.packages.get(token)
 
-    def remove(self, token: str) -> None:
+    def mark_downloaded(self, token: str) -> None:
+        """Oznacza pierwszą pełną wysyłkę paczki — od tego czasu liczy się TTL."""
+        package = self.packages.get(token)
+        if not package:
+            return
+        package["downloads"] = package.get("downloads", 0) + 1
+        if not package.get("downloaded_at"):
+            package["downloaded_at"] = time.time()
+            store_log.info("Paczka %s pobrana — usunę ja za %s min",
+                           package["file_name"], DELETE_AFTER_DOWNLOAD_MINUTES)
+
+    def remove(self, token: str, reason: str = "TTL") -> None:
         pkg = self.packages.pop(token, None)
         if not pkg:
             return
+        freed = 0
+        file_path = Path(pkg["file_path"])
         try:
-            Path(pkg["file_path"]).unlink(missing_ok=True)
+            if file_path.exists():
+                freed += file_path.stat().st_size
+                file_path.unlink()
         except OSError as exc:
             store_log.warning("Nie usunieto ZIPa: %s", exc)
         if pkg.get("workspace"):
+            freed += directory_size_bytes(Path(pkg["workspace"]))
             shutil.rmtree(pkg["workspace"], ignore_errors=True)
-        store_log.info("Usunieto paczke %s (TTL)", pkg["file_name"])
+        self.freed_bytes += freed
+        self.deleted_packages += 1
+        store_log.info("Usunieto paczke %s (%s, zwolniono %.2f MB)",
+                       pkg["file_name"], reason, freed / 1024 / 1024)
+
+    def remove_user_packages(self, user_id: int, reason: str = "kanał zamknięty") -> int:
+        """Usuwa wszystkie paczki użytkownika (np. gdy zamknie kanał sesji)."""
+        tokens = [t for t, p in self.packages.items() if p.get("user_id") == user_id]
+        for token in tokens:
+            self.remove(token, reason)
+        return len(tokens)
 
     # --- podglądy ---
-    def register_preview(self, html_text: str, title: str, user_id: str) -> str:
+    def register_preview(self, html_text: str, title: str, user_id: int) -> str:
         token = new_token()
         self.previews[token] = {
             "html": html_text, "title": title, "user_id": user_id, "created_at": time.time(),
@@ -658,23 +855,106 @@ class Storage:
     def get_preview(self, token: str) -> Optional[Dict[str, Any]]:
         return self.previews.get(token)
 
-    # --- sprzątanie ---
-    def sweep(self) -> None:
+    # --- GARBAGE COLLECTOR ---
+    def sweep(self) -> Dict[str, Any]:
+        """
+        Pełny cykl czyszczenia dysku.
+        Zwraca raport ze statystykami (ile usunięto, ile zwolniono).
+        """
         now = time.time()
-        ttl = DOWNLOAD_TTL_MINUTES * 60
-        for token in [t for t, p in self.packages.items() if now - p["created_at"] > ttl]:
-            self.remove(token)
-        for token in [t for t, p in self.previews.items() if now - p["created_at"] > ttl]:
-            self.previews.pop(token, None)
-        # porzucone workspace po restarcie bota
-        session_ttl = SESSION_TTL_MINUTES * 60
-        for directory in WORKSPACES_DIR.glob("*"):
-            if directory.is_dir() and now - directory.stat().st_mtime > session_ttl:
-                shutil.rmtree(directory, ignore_errors=True)
-                store_log.info("Porzadki: usunieto porzucony workspace %s", directory.name)
+        self.gc_runs += 1
+        removed = 0
+        freed_before = self.freed_bytes
 
-    def stats(self) -> Dict[str, int]:
-        return {"packages": len(self.packages), "previews": len(self.previews)}
+        # 1. Paczki pobrane — kasujemy DELETE_AFTER_DOWNLOAD_MINUTES po pobraniu
+        for token, package in list(self.packages.items()):
+            downloaded_at = package.get("downloaded_at")
+            if downloaded_at and now - downloaded_at > DELETE_AFTER_DOWNLOAD_MINUTES * 60:
+                self.remove(token, "pobrana paczka")
+                removed += 1
+
+        # 2. Paczki niepobrane — kasujemy po DOWNLOAD_TTL_MINUTES
+        for token, package in list(self.packages.items()):
+            if now - package["created_at"] > DOWNLOAD_TTL_MINUTES * 60:
+                self.remove(token, "wygasly link")
+                removed += 1
+
+        # 3. Podglądy
+        for token in [t for t, p in self.previews.items()
+                      if now - p["created_at"] > DOWNLOAD_TTL_MINUTES * 60]:
+            self.previews.pop(token, None)
+
+        # 4. Puste/porzucone katalogi robocze (także po restarcie bota)
+        session_ttl = SESSION_TTL_MINUTES * 60
+        for directory in list(WORKSPACES_DIR.glob("*")):
+            try:
+                if not directory.is_dir():
+                    continue
+                active = any(s.workspace == directory for s in SESSIONS.values())
+                if not active and now - directory.stat().st_mtime > session_ttl:
+                    self.freed_bytes += directory_size_bytes(directory)
+                    shutil.rmtree(directory, ignore_errors=True)
+                    store_log.info("GC: usunieto porzucony workspace %s", directory.name)
+            except OSError:
+                continue
+
+        # 5. Katalogi budowy pozostawione przez przerwane zadania (starsze niż 1 h)
+        for directory in list(WORKSPACES_DIR.glob("*/build-*")):
+            try:
+                if directory.is_dir() and now - directory.stat().st_mtime > 3600:
+                    self.freed_bytes += directory_size_bytes(directory)
+                    shutil.rmtree(directory, ignore_errors=True)
+                    store_log.info("GC: usunieto osierocony build %s", directory.name)
+            except OSError:
+                continue
+
+        # 6. Sieroty w downloads/ — ZIP-y zostawione przez crash / twardy restart
+        known_zips = {Path(p["file_path"]).resolve() for p in self.packages.values()}
+        for path in list(DOWNLOADS_DIR.glob("*.zip")):
+            try:
+                if path.resolve() in known_zips:
+                    continue
+                if now - path.stat().st_mtime > DOWNLOAD_TTL_MINUTES * 60:
+                    freed = path.stat().st_size
+                    path.unlink(missing_ok=True)
+                    self.freed_bytes += freed
+                    store_log.info("GC: usunieto osierocony ZIP %s (%.2f MB)",
+                                   path.name, freed / 1024 / 1024)
+            except OSError:
+                continue
+
+        # 7. Cache plików bazowych
+        cache_freed = FILE_CACHE.sweep()
+
+        report = {
+            "removed": removed,
+            "freed_bytes": (self.freed_bytes - freed_before) + cache_freed,
+            "cache_freed_bytes": cache_freed,
+            "runs": self.gc_runs,
+        }
+        if report["freed_bytes"]:
+            store_log.info("GC: usunieto %s paczek, zwolniono %.2f MB",
+                           removed, report["freed_bytes"] / 1024 / 1024)
+        return report
+
+    def disk_usage(self) -> Dict[str, int]:
+        """Zużycie dysku przez bota (do /status i /czysc)."""
+        return {
+            "downloads": directory_size_bytes(DOWNLOADS_DIR),
+            "workspaces": directory_size_bytes(WORKSPACES_DIR),
+            "cache": directory_size_bytes(CACHE_DIR),
+            "logs": directory_size_bytes(LOGS_DIR),
+        }
+
+    def stats(self) -> Dict[str, Any]:
+        return {
+            "packages": len(self.packages),
+            "previews": len(self.previews),
+            "downloaded": sum(1 for p in self.packages.values() if p.get("downloaded_at")),
+            "deleted": self.deleted_packages,
+            "freed_bytes": self.freed_bytes,
+            "gc_runs": self.gc_runs,
+        }
 
 
 STORAGE = Storage()
@@ -701,6 +981,9 @@ class Session:
         self.weapon_skins: Dict[str, str] = {}   # weapon_id -> skin_id
         self.external_skins: Dict[str, Dict[str, str]] = {}
         self.search_results: List[Dict[str, Any]] = []
+        self.search_query = ""                  # ostatnia fraza (paginacja wyników)
+        self.search_page = 0                    # aktualna strona wyników
+        self.searches_awarded: List[str] = []   # frazy, za które już dodano XP
         self.build_id = DEFAULT_BUILD_ID
         self.preview_token: Optional[str] = None
         self.created_at = time.time()
@@ -867,35 +1150,729 @@ def build_state_set(build_id: str, updated_by: str = "system") -> Dict[str, Any]
     return state
 
 # ============================================================================
+# 13.5. PROFILE GRACZY — XP, RANGI, ODZNAKI, PREFERENCJE, TOKENY PACZEK
+#    (Creator Economy: aktywność = odblokowane, ekskluzywne presety)
+# ============================================================================
+
+profile_log = log("Profiles")
+
+PROFILES_FILE = DATA_DIR / "profiles.json"
+PACKS_FILE = DATA_DIR / "packs.json"
+SECRET_FILE = DATA_DIR / "secret.key"
+
+# --- konfiguracja systemu XP i rekomendacji ---
+SMART_PINGS = os.getenv("SMART_PINGS", "1").strip().lower() not in ("0", "false", "no")
+SMART_PING_COOLDOWN_MINUTES = int(os.getenv("SMART_PING_COOLDOWN_MINUTES", "180") or 180)
+SMART_PING_MIN_SCORE = int(os.getenv("SMART_PING_MIN_SCORE", "6") or 6)
+PRIORITY_LANE = os.getenv("PRIORITY_LANE", "1").strip().lower() not in ("0", "false", "no")
+PRIORITY_LEVEL = int(os.getenv("PRIORITY_LEVEL", "1") or 1)
+PERSONALIZE_PACKS = os.getenv("PERSONALIZE_PACKS", "1").strip().lower() not in ("0", "false", "no")
+
+# Rangi twórców — im więcej budujesz, tym więcej odblokowujesz.
+RANKS: List[Dict[str, Any]] = [
+    {"level": 0, "name": "Nowicjusz", "xp": 0,
+     "perk": "Podstawowe presety citizena i cała baza skinów."},
+    {"level": 1, "name": "Rzemieślnik", "xp": 60,
+     "perk": "Priorytetowa ścieżka w kolejce ZIP — Twoja paczka startuje nawet w tłoku."},
+    {"level": 2, "name": "Konstruktor", "xp": 160,
+     "perk": "Ekskluzywne presety: nocne niebo, woda FPS, POTATO teren, krew ANIME, dźwięki bass."},
+    {"level": 3, "name": "Inżynier", "xp": 340,
+     "perk": "POTATO FULL, custom crosshair i ekskluzywne skiny broni (.rpf)."},
+    {"level": 4, "name": "Weteran", "xp": 640,
+     "perk": "Odznaki na profilu i pierwszeństwo w testowaniu nowych presetów."},
+    {"level": 5, "name": "Master Modder", "xp": 1100,
+     "perk": "Wszystko odblokowane + prywatne rekomendacje modów na priv."},
+]
+
+XP_EVENTS: Dict[str, int] = {
+    "build": 30,      # zbudowana paczka
+    "option": 4,      # każda wybrana opcja w paczce
+    "skin": 8,        # skin broni w paczce
+    "search": 3,      # użycie wyszukiwarki .rpf
+    "rate": 12,       # ocena skina / moda
+    "report": 25,     # zgłoszenie błędu lub podejrzanego pliku
+    "session": 10,    # ukończona sesja kreatora
+    "daily": 15,      # pierwsza aktywność danego dnia
+    "share": 6,       # podgląd/paczka wysłana dalej
+}
+
+# Ekskluzywne presety citizena (id kroku -> wymagany poziom twórcy)
+EXCLUSIVE_STEPS: Dict[str, int] = {
+    "sky-dark": 2,
+    "water-fps": 2,
+    "shadows-total": 3,
+    "potato-terrain": 2,
+    "potato-full": 3,
+    "sound-bass": 2,
+    "blood-anime": 2,
+    "crosshair-custom": 3,
+}
+for _step_def in CITIZEN_STEPS:
+    _step_def["min_level"] = EXCLUSIVE_STEPS.get(_step_def["id"], 0)
+
+# Ekskluzywne skiny broni (id skina -> wymagany poziom)
+EXCLUSIVE_SKINS: Dict[str, int] = {
+    "heavypistol-chrome": 2,
+    "smg-woodland": 2,
+    "ak47-redline": 3,
+    "pump-gold": 4,
+}
+for _category in WEAPON_CATEGORIES:
+    for _weapon_def in _category["weapons"]:
+        for _skin_def in _weapon_def["skins"]:
+            _skin_def["min_level"] = EXCLUSIVE_SKINS.get(_skin_def["id"], 0)
+
+BADGES: Dict[str, str] = {
+    "pierwsza-paczka": "🥇 Pierwsza paczka — witamy w Foundry!",
+    "konstruktor-10": "🏗️ 10 zbudowanych paczek citizen",
+    "mistrz-25": "🏆 25 zbudowanych paczek",
+    "zlota-bron": "🔫 5 skinów broni w paczkach",
+    "odkrywca": "🔎 Odkrywca — użyłeś wyszukiwarki .rpf",
+    "analityk": "🛡️ Analityk bezpieczeństwa — zgłoszenie podejrzanego pliku",
+    "wszechstronny": "🧩 Wszechstronny — opcje z 6 grup w jednej paczce",
+    "zna-buildy": "🎮 Zna buildy — paczki pod 3 różne wersje GTA V",
+}
+
+
+def level_for_xp(xp: int) -> int:
+    """Poziom wynikający z XP (progi z RANKS)."""
+    level = 0
+    for rank in RANKS:
+        if xp >= rank["xp"]:
+            level = rank["level"]
+    return level
+
+
+def rank_for_level(level: int) -> Dict[str, Any]:
+    """Definicja rangi dla poziomu."""
+    return RANKS[max(0, min(int(level), len(RANKS) - 1))]
+
+
+class Profile:
+    """Profil twórcy: XP, ranga, odznaki, preferencje i historia paczek."""
+
+    MAX_HISTORY = 20
+
+    def __init__(self, user_id: int, username: str = "") -> None:
+        self.user_id = int(user_id)
+        self.username = username
+        self.xp = 0
+        self.builds = 0
+        self.skins_picked = 0
+        self.searches = 0
+        self.reports = 0
+        self.badges: List[str] = []
+        self.preferences: Dict[str, int] = {}
+        self.history: List[Dict[str, Any]] = []
+        self.builds_seen: List[str] = []
+        self.dm_opt_in = True
+        self.last_dm_at = 0.0
+        self.last_seen = 0.0
+        self.days: List[str] = []
+
+    # --- ranga ---
+    @property
+    def level(self) -> int:
+        return level_for_xp(self.xp)
+
+    @property
+    def rank(self) -> Dict[str, Any]:
+        return rank_for_level(self.level)
+
+    def next_rank(self) -> Optional[Dict[str, Any]]:
+        """Najbliższa ranga do zdobycia (albo None na maksie)."""
+        for rank in RANKS:
+            if rank["xp"] > self.xp:
+                return rank
+        return None
+
+    def progress_line(self) -> str:
+        """Pasek postępu do następnej rangi."""
+        nxt = self.next_rank()
+        if not nxt:
+            return f"**{self.rank['name']}** (maksymalny poziom) • {self.xp} XP"
+        span = max(1, nxt["xp"] - self.rank["xp"])
+        done = max(0, self.xp - self.rank["xp"])
+        filled = max(0, min(10, round(done / span * 10)))
+        return (f"**{self.rank['name']}** (poziom {self.level}) • **{self.xp} XP**\n"
+                f"`{'█' * filled}{'░' * (10 - filled)}` {done}/{span} XP do rangi "
+                f"**{nxt['name']}**")
+
+    # --- XP i odznaki ---
+    def add_xp(self, event: str, amount: Optional[int] = None) -> Optional[str]:
+        """Dodaje XP. Zwraca komunikat o awansie (albo None)."""
+        before = self.level
+        self.xp += int(XP_EVENTS.get(event, 0) if amount is None else amount)
+        after = self.level
+        if after > before:
+            return (f"🎉 **Awans!** <@{self.user_id}> osiągnął poziom **{after}** — "
+                    f"ranga **{rank_for_level(after)['name']}**\n"
+                    f"🔓 Odblokowane: {rank_for_level(after)['perk']}")
+        return None
+
+    def remember(self, tags: Sequence[str], weight: int = 1) -> None:
+        """Zapamiętuje preferencje gracza (podstawa rekomendacji modów)."""
+        for tag in tags:
+            key = str(tag).strip().lower()
+            if key:
+                self.preferences[key] = self.preferences.get(key, 0) + weight
+
+    def top_tags(self, limit: int = 4) -> List[str]:
+        """Najmocniejsze preferencje gracza."""
+        return [tag for tag, _ in sorted(self.preferences.items(), key=lambda kv: kv[1],
+                                        reverse=True)[:limit]]
+
+    def badge(self, name: str) -> bool:
+        """Przyznaje odznakę (zwraca True, jeśli to nowa odznaka)."""
+        if name in self.badges or name not in BADGES:
+            return False
+        self.badges.append(name)
+        return True
+
+    def badges_text(self) -> str:
+        return "\n".join(BADGES[b] for b in self.badges if b in BADGES) or "*Brak odznak — czas zacząć!*"
+
+    def add_history(self, entry: Dict[str, Any]) -> None:
+        """Historia paczek (maks. MAX_HISTORY) — do rekomendacji i statystyk."""
+        self.history.insert(0, entry)
+        del self.history[self.MAX_HISTORY:]
+
+    def remember_build(self, build_id: str) -> None:
+        if build_id and build_id not in self.builds_seen:
+            self.builds_seen.append(build_id)
+            del self.builds_seen[:-10]
+
+    def touch_day(self) -> bool:
+        """Zwraca True, jeśli to pierwsza aktywność gracza danego dnia."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        self.last_seen = time.time()
+        if today in self.days:
+            return False
+        self.days.append(today)
+        del self.days[:-60]
+        return True
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "user_id": self.user_id, "username": self.username, "xp": self.xp,
+            "builds": self.builds, "skins": self.skins_picked, "searches": self.searches,
+            "reports": self.reports, "badges": self.badges, "preferences": self.preferences,
+            "history": self.history, "builds_seen": self.builds_seen,
+            "dm_opt_in": self.dm_opt_in, "last_dm_at": self.last_dm_at,
+            "last_seen": self.last_seen, "days": self.days,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Profile":
+        profile = cls(int(data.get("user_id", 0)), data.get("username", ""))
+        profile.xp = int(data.get("xp", 0))
+        profile.builds = int(data.get("builds", 0))
+        profile.skins_picked = int(data.get("skins", 0))
+        profile.searches = int(data.get("searches", 0))
+        profile.reports = int(data.get("reports", 0))
+        profile.badges = list(data.get("badges") or [])
+        profile.preferences = {str(k): int(v) for k, v in (data.get("preferences") or {}).items()}
+        profile.history = list(data.get("history") or [])
+        profile.builds_seen = list(data.get("builds_seen") or [])
+        profile.dm_opt_in = bool(data.get("dm_opt_in", True))
+        profile.last_dm_at = float(data.get("last_dm_at", 0.0))
+        profile.last_seen = float(data.get("last_seen", 0.0))
+        profile.days = list(data.get("days") or [])
+        return profile
+
+
+PROFILES: Dict[int, Profile] = {}
+_profiles_loaded = False
+
+
+def profiles_load(force: bool = False) -> None:
+    """Wczytuje profile z data/profiles.json (raz na start bota)."""
+    global _profiles_loaded
+    if _profiles_loaded and not force:
+        return
+    _profiles_loaded = True
+    try:
+        raw = json.loads(PROFILES_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    for item in raw if isinstance(raw, list) else raw.values():
+        try:
+            profile = Profile.from_dict(item)
+            PROFILES[profile.user_id] = profile
+        except Exception as exc:  # noqa: BLE001
+            profile_log.warning("Nie wczytano profilu: %s", exc)
+    profile_log.info("Profile: wczytano %s graczy (poziom max: %s)",
+                     len(PROFILES), max((p.level for p in PROFILES.values()), default=0))
+
+
+def profiles_save() -> None:
+    """Zapisuje profile atomowo (plik tymczasowy + podmiana)."""
+    try:
+        PROFILES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temp = PROFILES_FILE.with_suffix(".json.tmp")
+        temp.write_text(json.dumps([p.to_dict() for p in PROFILES.values()],
+                                   ensure_ascii=False, indent=1), encoding="utf-8")
+        os.replace(temp, PROFILES_FILE)
+    except OSError as exc:
+        profile_log.error("Nie zapisano profili: %s", exc)
+
+
+def profile_get(user: Optional[discord.abc.User], create: bool = True) -> Optional[Profile]:
+    """Profil gracza (tworzy nowy, jeśli nie istnieje)."""
+    profiles_load()
+    if user is None:
+        return None
+    profile = PROFILES.get(int(user.id))
+    if profile is None and create:
+        profile = Profile(int(user.id), str(getattr(user, "name", "") or user))
+        PROFILES[profile.user_id] = profile
+    if profile is not None:
+        profile.username = str(getattr(user, "name", "") or profile.username)
+    return profile
+
+
+def profile_by_id(user_id: int) -> Optional[Profile]:
+    """Profil po ID gracza (bez tworzenia nowego) — np. dla kroków kreatora."""
+    profiles_load()
+    return PROFILES.get(int(user_id))
+
+
+async def award_xp(profile: Optional[Profile], event: str,
+                   channel: Optional[discord.abc.Messageable] = None,
+                   amount: Optional[int] = None, reason: str = "") -> Optional[str]:
+    """Nadaje XP, zapisuje profil i ogłasza awans na kanale sesji."""
+    if profile is None:
+        return None
+    message = profile.add_xp(event, amount)
+    profiles_save()
+    if message and channel is not None:
+        try:
+            await channel.send(message)
+        except discord.HTTPException:
+            pass
+    profile_log.info("XP %s (+%s) dla %s %s", event,
+                     XP_EVENTS.get(event, amount), profile.user_id, reason)
+    return message
+
+
+def min_level_of(item: Dict[str, Any]) -> int:
+    """Wymagany poziom twórcy dla preseta/skina."""
+    try:
+        return int(item.get("min_level", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def is_locked(profile: Optional[Profile], item: Dict[str, Any]) -> bool:
+    """Czy preset jest zablokowany dla tego gracza?"""
+    return (profile.level if profile else 0) < min_level_of(item)
+
+
+def lock_text(item: Dict[str, Any]) -> str:
+    """Opis blokady pokazywany graczowi."""
+    level = min_level_of(item)
+    return (f"🔒 **Preset dla rangi {rank_for_level(level)['name']}** (poziom {level})\n"
+            "Buduj paczki i oceniaj mody, żeby zdobyć XP i go odblokować.")
+
+
+# --- podpis paczek i tokeny personalizacji ---
+
+PACK_TOKENS: Dict[str, Dict[str, Any]] = {}
+
+
+def pack_secret() -> bytes:
+    """Trwały sekret do podpisu paczek (nie zmienia się między restartami)."""
+    try:
+        secret = SECRET_FILE.read_bytes()
+        if len(secret) >= 16:
+            return secret
+    except OSError:
+        pass
+    secret = os.urandom(32)
+    try:
+        SECRET_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SECRET_FILE.write_bytes(secret)
+    except OSError as exc:
+        profile_log.warning("Nie zapisano sekretu paczek: %s", exc)
+    return secret
+
+
+def pack_sign(payload: Dict[str, Any]) -> str:
+    """HMAC-SHA256 paczki — pozwala serwerowi FiveM sprawdzić, kto ją wygenerował."""
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hmac.new(pack_secret(), canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def packs_load() -> None:
+    """Wczytuje wydane tokeny paczek (żeby /api działało po restarcie)."""
+    try:
+        raw = json.loads(PACKS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    for token, record in raw.items() if isinstance(raw, dict) else []:
+        try:
+            PACK_TOKENS[str(token)] = dict(record)
+        except (TypeError, ValueError):
+            continue
+    profile_log.info("Tokeny paczek: %s aktywnych", len(PACK_TOKENS))
+
+
+def packs_save() -> None:
+    """Zapisuje tokeny paczek (ostatnie 500, żeby plik nie puchł)."""
+    try:
+        PACKS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        newest = dict(sorted(PACK_TOKENS.items(), key=lambda kv: kv[1].get("created_at", 0),
+                             reverse=True)[:500])
+        PACK_TOKENS.clear()
+        PACK_TOKENS.update(newest)
+        temp = PACKS_FILE.with_suffix(".json.tmp")
+        temp.write_text(json.dumps(PACK_TOKENS, ensure_ascii=False, indent=1), encoding="utf-8")
+        os.replace(temp, PACKS_FILE)
+    except OSError as exc:
+        profile_log.error("Nie zapisano tokenów paczek: %s", exc)
+
+
+def pack_token_create(profile: Profile, session: Session, kind: str,
+                      items: Sequence[Dict[str, Any]], build: Dict[str, str]) -> Dict[str, Any]:
+    """Tworzy unikalny, podpisany token paczki (personalizacja + weryfikacja)."""
+    token = f"FM-{os.urandom(4).hex().upper()}"
+    payload = {
+        "token": token,
+        "kind": kind,
+        "user_id": profile.user_id,
+        "username": profile.username,
+        "level": profile.level,
+        "rank": profile.rank["name"],
+        "build": build["id"],
+        "build_name": build["name"],
+        "items": [{"id": i.get("id"), "name": i.get("name")} for i in items],
+        "created_at": int(time.time()),
+    }
+    record = {**payload, "signature": pack_sign(payload), "downloads": 0}
+    PACK_TOKENS[token] = record
+    packs_save()
+    return record
+
+
+def pack_token_get(token: str) -> Optional[Dict[str, Any]]:
+    """Token paczki + weryfikacja podpisu."""
+    record = PACK_TOKENS.get(token)
+    if not record:
+        return None
+    payload = {k: v for k, v in record.items() if k not in ("signature", "downloads")}
+    record = dict(record)
+    record["valid"] = pack_sign(payload) == record.get("signature")
+    return record
+
+
+def write_personalization(workspace: Path, profile: Profile, kind: str,
+                          items: Sequence[Dict[str, Any]], build: Dict[str, str],
+                          token_record: Dict[str, Any]) -> List[Path]:
+    """
+    Wrzuca do paczki unikalne metadane twórcy (FOUNDRY-PROFILE.json + PROFILE.txt).
+
+    Dzięki temu każda paczka jest inna i możliwe jest sprawdzenie jej
+    pochodzenia (podpis HMAC) — a serwer FiveM może po tokenie rozpoznać autora.
+    """
+    if not PERSONALIZE_PACKS:
+        return []
+    payload = dict(token_record)
+    payload["generated_by"] = "FiveM Mod Foundry"
+    payload["user"] = {"id": profile.user_id, "name": profile.username,
+                       "xp": profile.xp, "builds": profile.builds,
+                       "preferences": profile.top_tags(6)}
+    payload["pack"] = {"kind": kind, "build": build["id"],
+                       "item_count": len(items)}
+
+    json_path = workspace / "FOUNDRY-PROFILE.json"
+    json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    lines = [
+        "=" * 62,
+        "  PACZKA PERSONALIZOWANA — FIVEM MOD FOUNDRY",
+        "=" * 62,
+        f"  Twórca  : {profile.username or profile.user_id} (ID {profile.user_id})",
+        f"  Ranga   : {profile.rank['name']} (poziom {profile.level}, {profile.xp} XP)",
+        f"  Token   : {token_record['token']}",
+        f"  Podpis  : {token_record['signature'][:32]}…",
+        f"  Build   : {build['name']}",
+        f"  Typ     : {'citizen' if kind == 'citizen' else 'skiny broni'}",
+        f"  Pozycji : {len(items)}",
+        "",
+        "  Paczka jest unikalna — metadane i podpis znajdują się też w pliku",
+        "  FOUNDRY-PROFILE.json. Token możesz podać administracji serwera, żeby",
+        "  potwierdzić pochodzenie paczki.",
+        "=" * 62,
+    ]
+    text_path = workspace / "PROFILE.txt"
+    text_path.write_text("\n".join(lines), encoding="utf-8")
+    return [json_path, text_path]
+
+
+# --- inteligentne rekomendacje (dopasowanie modów do preferencji) ---
+
+TAG_RULES: List[Tuple[str, Tuple[str, ...]]] = [
+    ("sky", ("niebo", "grafika")),
+    ("clouds", ("grafika", "optymalizacja")),
+    ("sun", ("grafika", "niebo")),
+    ("water", ("woda", "grafika")),
+    ("colors", ("grafika",)),
+    ("shadows", ("optymalizacja", "cienie")),
+    ("postfx", ("optymalizacja", "grafika")),
+    ("props", ("optymalizacja", "mapy")),
+    ("windows", ("optymalizacja", "pojazdy")),
+    ("tire", ("pojazdy", "optymalizacja")),
+    ("fire", ("pojazdy", "optymalizacja")),
+    ("potato", ("potato", "optymalizacja")),
+    ("grass", ("potato", "mapy")),
+    ("sound", ("dźwięk",)),
+    ("blood", ("krew",)),
+    ("hitmarker", ("hud",)),
+    ("crosshair", ("hud",)),
+]
+
+CATEGORY_TAGS: Dict[str, Tuple[str, ...]] = {
+    "OPTI": ("optymalizacja", "fps"),
+    "POTATO": ("potato", "optymalizacja"),
+    "FIRST PERSON": ("first person", "hud"),
+    "SKINY BRONI": ("skiny-broni",),
+    "MAPY": ("mapy", "pvp"),
+    "GRAFIKA": ("grafika", "niebo"),
+    "AUTA": ("pojazdy",),
+    "INNE": (),
+}
+
+VIDEO_KEYWORDS: Tuple[str, ...] = ("potato", "first person", "fps", "krew", "hud", "crosshair",
+                                  "mapy", "skiny-broni", "niebo", "optymalizacja", "woda",
+                                  "pojazdy", "grafika")
+
+
+def tags_for_step(step_id: str) -> List[str]:
+    """Tagi preferencji dla wybranej opcji kreatora (podstawa rekomendacji)."""
+    for prefix, tags in TAG_RULES:
+        if step_id.startswith(prefix):
+            return list(tags)
+    return ["citizen"]
+
+
+def video_tags(video: Dict[str, Any]) -> List[str]:
+    """Tagi moda z YouTube (kategoria + słowa z tytułu)."""
+    tags = list(CATEGORY_TAGS.get(str(video.get("category", "INNE")), ()))
+    title = str(video.get("title") or "").lower()
+    tags += [keyword for keyword in VIDEO_KEYWORDS if keyword in title]
+    return list(dict.fromkeys(tags))
+
+
+def recommend_score(profile: Profile, tags: Sequence[str]) -> int:
+    """Trafność moda dla gracza = suma jego preferencji dla tagów moda."""
+    return sum(profile.preferences.get(tag, 0) for tag in tags)
+
+
+def recommend_profiles(tags: Sequence[str], min_score: Optional[int] = None,
+                       limit: int = 3) -> List[Tuple[int, Profile]]:
+    """Zwraca najlepiej dopasowanych graczy (score, profil), którzy chcą powiadomień."""
+    threshold = SMART_PING_MIN_SCORE if min_score is None else min_score
+    scored: List[Tuple[int, Profile]] = []
+    for profile in PROFILES.values():
+        if not profile.dm_opt_in:
+            continue
+        score = recommend_score(profile, tags)
+        if score >= threshold:
+            scored.append((score, profile))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return scored[:limit]
+
+
+async def send_smart_pings(bot_instance: "FoundryBot",
+                           videos: Sequence[Dict[str, Any]]) -> int:
+    """
+    Inteligentne powiadomienia: nowy mod trafia na priv tylko do graczy, których
+    zapamiętane wybory (np. POTATO + optymalizacja) pasują do jego tagów.
+    Zabezpieczenia: zgoda gracza (/ustawienia), limit na skan i cooldown.
+    """
+    if not SMART_PINGS or not videos:
+        return 0
+    now = time.time()
+    sent = 0
+    for video in videos:
+        tags = video_tags(video)
+        if not tags:
+            continue
+        for score, profile in recommend_profiles(tags, limit=3):
+            if sent >= 10:  # nigdy więcej niż 10 DM-ów na jeden skan
+                return sent
+            if now - profile.last_dm_at < SMART_PING_COOLDOWN_MINUTES * 60:
+                continue
+            user = bot_instance.get_user(profile.user_id)
+            if user is None:
+                try:
+                    user = await bot_instance.fetch_user(profile.user_id)
+                except discord.HTTPException:
+                    continue
+            embed = discord.Embed(
+                title=f"🎯 Nowy mod dla Ciebie: {video['title'][:180]}",
+                url=f"https://www.youtube.com/watch?v={video['id']}",
+                description=(f"Kategoria: **{video.get('category', 'MOD')}** • dopasowanie: **{score} pkt**\n"
+                             f"Twoje preferencje: {', '.join(profile.top_tags(4)) or 'brak'}\n\n"
+                             f"Kanał: {video.get('channel', '?')}"),
+                color=C_PURPLE, timestamp=datetime.now(timezone.utc))
+            if video.get("thumbnail"):
+                embed.set_thumbnail(url=video["thumbnail"])
+            embed.set_footer(text="Rekomendacja na podstawie Twoich wyborów w kreatorze • /ustawienia")
+            try:
+                await user.send(embed=embed)
+            except (discord.Forbidden, discord.HTTPException):
+                profile.dm_opt_in = False  # zamknięte DM-y — nie próbuj ponownie
+                continue
+            profile.last_dm_at = now
+            sent += 1
+    if sent:
+        profiles_save()
+        profile_log.info("Smart pingi: wyslano %s rekomendacji", sent)
+    return sent
+
+# ============================================================================
 # 14. KOLEJKA ZADAŃ (chroni serwer przy pakowaniu ZIP-ów)
 # ============================================================================
 
 
-class TaskQueue:
-    """Kolejka FIFO z ograniczoną równoległością (asyncio.Semaphore)."""
+queue_log = log("Queue")
 
-    def __init__(self, concurrency: int = 2) -> None:
-        self._sem = asyncio.Semaphore(max(1, concurrency))
+
+class TaskQueue:
+    """
+    Kolejka FIFO z ograniczoną równoległością (asyncio.Semaphore).
+
+    Chroni serwer przed przeciążeniem: pakowanie ZIP-ów zajmuje CPU i dysk,
+    więc przy ZIP_QUEUE_CONCURRENCY=2 maksymalnie 2 paczki liczą się naraz,
+    a reszta czeka w kolejce. Gracz dostaje informację o swojej pozycji
+    („Twoja paczka jest w kolejce (pozycja 2)...”) i wie, że bot go nie pominął.
+    """
+
+    def __init__(self, concurrency: int = 2, name: str = "ZIP") -> None:
+        self.name = name
+        self.concurrency_limit = max(1, concurrency)
+        self._sem = asyncio.Semaphore(self.concurrency_limit)
+        # Priority lane: gracze od rangi PRIORITY_LEVEL dostają jedno dodatkowe
+        # miejsce, więc nie czekają w ogonku za tłumem.
+        self._priority_sem = asyncio.Semaphore(1) if PRIORITY_LANE else None
+        self.waiting = 0
+        self.running = 0
         self.completed = 0
         self.failed = 0
+        self.priority_jobs = 0
+        self.total_wait_seconds = 0.0
 
     @property
-    def concurrency(self) -> int:
-        return self._sem._value  # informacyjnie (wolne sloty)
+    def busy(self) -> int:
+        """Ile zadań jest aktualnie przetwarzanych."""
+        return self.running
 
-    async def add(self, coro_func, *args, **kwargs):
-        """Wykonuje zadanie w kolejce i zwraca jego wynik."""
-        async with self._sem:
+    async def add(self, coro_func, *args,
+                  on_queued=None, on_start=None, priority: bool = False, **kwargs):
+        """
+        Wykonuje zadanie w kolejce i zwraca jego wynik.
+
+        on_queued(position) — wywoływane od razu, gdy zadanie trafi do kolejki
+                              (position > 1 oznacza, że trzeba poczekać),
+        on_start(wait_seconds) — wywoływane w momencie rozpoczęcia pracy,
+        priority — zadanie z priority lane (wyższe rangi twórców) startuje
+                   nawet wtedy, gdy zwykła kolejka jest zajęta.
+        """
+        self.waiting += 1
+        # Pozycja = zadania już pakowane + te zakolejkowane przede mną.
+        # (liczenie samego `waiting` myliłoby, gdy pierwsze zadanie zdąży już
+        # wejść do semafora — drugi gracz widziałby pozycję 1 zamiast 2)
+        position = self.waiting + self.running
+        enqueued_at = time.time()
+
+        if on_queued is not None:
             try:
-                result = await coro_func(*args, **kwargs)
-                self.completed += 1
-                return result
-            except Exception:
-                self.failed += 1
-                raise
+                await on_queued(position)
+            except Exception as exc:  # noqa: BLE001
+                queue_log.warning("on_queued zawiodlo: %s", exc)
+
+        try:
+            if priority and self._priority_sem is not None:
+                self.priority_jobs += 1
+                queue_log.info("Zadanie PRIORYTETOWE (%s) — startuje poza zwykla kolejka", self.name)
+                async with self._priority_sem:
+                    return await self._run(coro_func, position, enqueued_at, on_start,
+                                           args, kwargs, lane=True)
+            return await self._run(coro_func, position, enqueued_at, on_start, args, kwargs)
+        except Exception:
+            self.failed += 1
+            raise
+        finally:
+            self.running -= 1
+            if self.waiting < 0:  # zabezpieczenie przed rozjazdem licznika
+                self.waiting = 0
+
+    async def _run(self, coro_func, position: int, enqueued_at: float, on_start,
+                   args: tuple, kwargs: dict, lane: bool = False):
+        """
+        Wykonanie zadania.
+
+        lane=True to priority lane (wyższe rangi twórców) — omija zwykły semafor,
+        więc nie stoi w kolejce za zadaniami, które dopiero czekają.
+        """
+        if lane:
+            return await self._execute(coro_func, position, enqueued_at, on_start, args, kwargs)
+        async with self._sem:
+            return await self._execute(coro_func, position, enqueued_at, on_start, args, kwargs)
+
+    async def _execute(self, coro_func, position: int, enqueued_at: float, on_start,
+                       args: tuple, kwargs: dict):
+        """Właściwa praca zadania (pomiar czasu oczekiwania + statystyki)."""
+        self.waiting -= 1
+        self.running += 1
+        wait_seconds = time.time() - enqueued_at
+        self.total_wait_seconds += wait_seconds
+        if position > 1:
+            queue_log.info("Zadanie z kolejki startuje po %.1f s (bylo %s przed nim)",
+                           wait_seconds, position - 1)
+        if on_start is not None:
+            try:
+                await on_start(wait_seconds)
+            except Exception as exc:  # noqa: BLE001
+                queue_log.warning("on_start zawiodlo: %s", exc)
+        result = await coro_func(*args, **kwargs)
+        self.completed += 1
+        return result
+
+    async def run_all(self, jobs: Sequence[Any], concurrency: Optional[int] = None) -> List[Any]:
+        """Uruchamia wiele zadań (np. pre-cache) z ograniczoną równoległością."""
+        limit = concurrency or self.concurrency_limit
+        semaphore = asyncio.Semaphore(max(1, limit))
+        results: List[Any] = []
+
+        async def worker(index: int, job) -> None:
+            async with semaphore:
+                try:
+                    results.append(await job())
+                except Exception as exc:  # noqa: BLE001
+                    self.failed += 1
+                    queue_log.warning("Zadanie %s w kolejce %s nieudane: %s", index, self.name, exc)
+
+        await asyncio.gather(*[worker(i, job) for i, job in enumerate(jobs)])
+        return results
+
+    def info(self) -> Dict[str, Any]:
+        """Statystyki kolejki (do /status)."""
+        average = self.total_wait_seconds / self.completed if self.completed else 0.0
+        return {
+            "name": self.name,
+            "waiting": self.waiting,
+            "running": self.running,
+            "completed": self.completed,
+            "failed": self.failed,
+            "concurrency": self.concurrency_limit,
+            "average_wait": average,
+            "priority_jobs": self.priority_jobs,
+        }
 
 
-ZIP_QUEUE = TaskQueue(ZIP_QUEUE_CONCURRENCY)
+ZIP_QUEUE = TaskQueue(ZIP_QUEUE_CONCURRENCY, "ZIP")
 
 # ============================================================================
 # 15. PROCESOR PLIKÓW — pobieranie, struktura citizen/mods, manifest, ZIP
@@ -955,21 +1932,128 @@ def resolve_file_name(item: Dict[str, str]) -> str:
     return from_url or "plik.bin"
 
 
+async def fetch_to_cache(http: aiohttp.ClientSession, url: str) -> Path:
+    """
+    Zwraca ścieżkę pliku w lokalnym cache, pobierając go TYLKO raz.
+
+    Kolejny gracz, który wybierze ten sam mod, dostaje go z dysku — dlatego
+    budowanie paczki spada z kilkudziesięciu sekund do ułamka sekundy.
+    """
+    cached = FILE_CACHE.lookup(url)
+    if cached is not None:
+        return cached
+
+    target = FILE_CACHE.path_for(url)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staging = target.with_name(target.name + ".part")
+    try:
+        await download_file(http, url, staging)          # skan bezpieczeństwa w środku
+        await asyncio.to_thread(os.replace, staging, target)
+    except Exception:
+        await asyncio.to_thread(lambda: staging.unlink(missing_ok=True))
+        raise
+    cache_log.info("Cache: pobrano i zapisano %s (%.1f KB)", target.name,
+                   target.stat().st_size / 1024)
+    return target
+
+
 async def process_items(workspace: Path, items: Sequence[Dict[str, str]]) -> List[Dict[str, Any]]:
-    """Pobiera pozycje do workspace i liczy ich hashe."""
+    """
+    Buduje pliki we workspace: z lokalnego cache (natychmiast) albo z sieci.
+    Liczy SHA-256 każdego pliku (manifest + HASHES.txt w paczce).
+    """
     hashes: List[Dict[str, Any]] = []
     async with aiohttp.ClientSession(headers={"User-Agent": "FiveMModFoundry/2.0"}) as http:
         for item in items:
+            url = item["file_url"]
             file_name = resolve_file_name(item)
             dest = workspace / item["target"] / file_name
-            fp_log.info("Pobieram: %s -> %s", item["file_url"], dest)
-            await download_file(http, item["file_url"], dest)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            source = FILE_CACHE.lookup(url)
+            if source is not None:
+                fp_log.info("Cache HIT: %s -> %s", url, dest.relative_to(workspace))
+            else:
+                fp_log.info("Pobieram (raz, potem z cache): %s", url)
+                source = await fetch_to_cache(http, url)
+            await asyncio.to_thread(shutil.copyfile, source, dest)
             digest, size = sha256_file(dest)
             rel = dest.relative_to(workspace).as_posix()
             hashes.append({"path": rel, "sha256": digest, "size": size})
             fp_log.info("  ✓ %s (%.1f KB)", file_name, size / 1024)
             item["file_name"] = file_name
     return hashes
+
+
+def all_configured_items() -> List[Dict[str, str]]:
+    """
+    Wszystkie pliki, jakich bot może potrzebować: kroki citizena + skiny broni.
+    Używane przez pre-cache (żeby pierwsze paczki graczy były natychmiastowe).
+    """
+    items: List[Dict[str, str]] = [
+        {"id": step["id"], "name": step["name"], "file_url": step["file_url"],
+         "file_name": step["file_name"], "target": step["target"]}
+        for step in CITIZEN_STEPS
+    ]
+    items += [
+        {"id": skin["id"], "name": f"{weapon['name']} — {skin['name']}",
+         "file_url": skin["file_url"], "file_name": skin["file_name"], "target": skin["target"]}
+        for weapon in all_weapons() for skin in weapon["skins"]
+    ]
+    return items
+
+
+async def precache_items(items: Optional[Sequence[Dict[str, str]]] = None) -> Dict[str, int]:
+    """
+    Wstępne pobranie plików bazowych do cache (uruchamiane przy starcie bota
+    i przyciskiem w /cache). Pierwszy gracz po restarcie i tak dostaje paczkę
+    szybko, bo pliki leżą już na dysku.
+    """
+    if not CACHE_ENABLED:
+        cache_log.info("Cache wyłączony (CACHE_ENABLED=0) — pomijam pre-cache.")
+        return {"ok": 0, "failed": 0, "skipped": 0}
+
+    configured = list(items or all_configured_items())
+    placeholders = [item for item in configured
+                    if "example.com" in (item.get("file_url") or "")]
+    configured = [item for item in configured if item not in placeholders]
+    if not configured:
+        cache_log.warning(
+            "Cache: pre-cache pominięty — %s pozycji nadal ma przykładowe adresy "
+            "(PODMIEŃ IMG_BASE/FILE_BASE/SKIN_BASE w bot.py).", len(placeholders))
+        return {"ok": 0, "failed": 0, "skipped": len(placeholders)}
+    if placeholders:
+        cache_log.warning("Cache: pomijam %s pozycji z przykładowymi adresami.", len(placeholders))
+
+    todo = [item for item in configured
+            if item.get("file_url") and not FILE_CACHE.lookup(item["file_url"])]
+    if not todo:
+        cache_log.info("Cache: wszystko już na dysku (%s plików).", len(FILE_CACHE.files()))
+        return {"ok": 0, "failed": 0, "skipped": len(configured)}
+
+    cache_log.info("Cache: wstępnie pobieram %s plików (max %s naraz)...",
+                   len(todo), min(4, ZIP_QUEUE.concurrency_limit + 2))
+    ok = 0
+    failed = 0
+
+    async with aiohttp.ClientSession(headers={"User-Agent": "FiveMModFoundry/2.0"}) as http:
+        async def one(item: Dict[str, str]) -> None:
+            nonlocal ok, failed
+            try:
+                await fetch_to_cache(http, item["file_url"])
+                ok += 1
+            except Exception as exc:  # noqa: BLE001
+                failed += 1
+                cache_log.warning("Cache: nie pobrano %s (%s)",
+                                  item.get("name") or item.get("file_url"), exc)
+
+        await ZIP_QUEUE.run_all(
+            [partial(one, item) for item in todo],
+            concurrency=min(4, ZIP_QUEUE.concurrency_limit + 2),
+        )
+
+    cache_log.info("Cache: gotowe — %s pobranych, %s błędów, %.1f MB na dysku.",
+                   ok, failed, FILE_CACHE.size_bytes() / 1024 / 1024)
+    return {"ok": ok, "failed": failed, "skipped": 0}
 
 
 def write_manifests(workspace: Path, hashes: Sequence[Dict[str, Any]], build: Dict[str, str],
@@ -1078,6 +2162,7 @@ async def deliver_package(interaction: discord.Interaction, session: Session,
         return
 
     build = build_by_id(session.build_id)
+    profile = profile_get(getattr(interaction, "user", None))
     fp_log.info("User %s: pakowanie %s pozycji (%s)", session.user_id, len(items), kind)
 
     async def build_package() -> Dict[str, Any]:
@@ -1085,6 +2170,17 @@ async def deliver_package(interaction: discord.Interaction, session: Session,
         build_dir.mkdir(parents=True, exist_ok=True)
         try:
             hashes = await process_items(build_dir, items)
+            # Personalizacja: unikalny token + podpis + metadane twórcy w paczce
+            token_record = None
+            if profile is not None:
+                token_record = await asyncio.to_thread(
+                    pack_token_create, profile, session, kind, items, build)
+                extra = await asyncio.to_thread(
+                    write_personalization, build_dir, profile, kind, items, build, token_record)
+                for path in extra:
+                    digest, extra_size = sha256_file(path)
+                    hashes.append({"path": path.relative_to(build_dir).as_posix(),
+                                   "sha256": digest, "size": extra_size})
             write_manifests(build_dir, hashes, build, session.user_id, kind, items, conflicts)
             (build_dir / "INSTRUKCJA.txt").write_text(
                 instruction_text(
@@ -1094,22 +2190,60 @@ async def deliver_package(interaction: discord.Interaction, session: Session,
             zip_path = DOWNLOADS_DIR / f"{kind}-{session.user_id}-{int(time.time())}.zip"
             size = await asyncio.to_thread(zip_directory, build_dir, zip_path)
             file_count = count_files(build_dir)
-            return {"zip_path": zip_path, "size": size, "file_count": file_count}
+            return {"zip_path": zip_path, "size": size, "file_count": file_count,
+                    "pack_token": (token_record or {}).get("token")}
         finally:
             await asyncio.to_thread(safe_rmtree, build_dir, session.workspace)
 
+    queue_note: Dict[str, int] = {"position": 1}
+
+    async def on_queued(position: int) -> None:
+        """Mówi graczowi, że bot go nie pominął i ile ma czekać."""
+        if not QUEUE_NOTIFY:
+            return
+        queue_note["position"] = position
+        if position > 1:
+            average = (ZIP_QUEUE.total_wait_seconds / ZIP_QUEUE.completed) if ZIP_QUEUE.completed else 0.0
+            eta = f" Szacowany czas oczekiwania: ~**{max(1, int(average))} s**." if average else ""
+            await interaction.followup.send(
+                f"⏳ Twoja paczka jest w kolejce — **pozycja {position}** "
+                f"(pakuję maksymalnie {ZIP_QUEUE.concurrency_limit} naraz).{eta}", ephemeral=True)
+        else:
+            await interaction.followup.send("🔨 Pakuję Twoją paczkę... (zwykle kilka sekund)",
+                                           ephemeral=True)
+
+    async def on_start(wait_seconds: float) -> None:
+        """Informuje, gdy po oczekiwaniu w kolejce startuje pakowanie."""
+        if not QUEUE_NOTIFY or wait_seconds < 3 or queue_note["position"] <= 1:
+            return
+        try:
+            await interaction.followup.send(
+                f"✅ Kolejka wolna — kończę pakowanie (czekałem {wait_seconds:.0f} s).", ephemeral=True)
+        except discord.HTTPException:
+            pass
+
+    priority = bool(PRIORITY_LANE and profile is not None and profile.level >= PRIORITY_LEVEL)
     try:
-        result = await ZIP_QUEUE.add(build_package)
+        result = await ZIP_QUEUE.add(build_package, on_queued=on_queued, on_start=on_start,
+                                     priority=priority)
     except ApprovalRequired as exc:
         await request_approval(interaction, session, exc)
         return
     except Exception as exc:  # noqa: BLE001
-        fp_log.error("Blad budowania paczki: %s", exc)
-        await interaction.followup.send(f"❌ Błąd budowania paczki: {exc}", ephemeral=True)
+        eid = await notify_error("Błąd budowania paczki",
+                                 f"kind={kind}, pozycji={len(items)}, user={session.user_id}",
+                                 exc, "deliver_package", getattr(interaction, "user", None))
+        try:
+            await interaction.followup.send(
+                "😔 **Ups, coś poszło nie tak podczas pakowania paczki.**\n"
+                "Twoje wybory nie przepadły — kliknij **📦 Zakończ** jeszcze raz.\n"
+                f"Jeśli błąd wraca, zgłoś administracji kod: `{eid}`", ephemeral=True)
+        except discord.HTTPException:
+            pass
         return
 
     token = STORAGE.register(result["zip_path"], result["zip_path"].name, result["size"],
-                             result["file_count"], session.user_id)
+                             result["file_count"], session.user_id, workspace=session.workspace)
     link = f"{PUBLIC_URL}/download/{token}"
     session.delivered_at = time.time()
 
@@ -1128,12 +2262,52 @@ async def deliver_package(interaction: discord.Interaction, session: Session,
         lines += ["", f"⚠️ Auto-rozwiązano **{len(conflicts)}** konflikt(ów) plików."]
     if session.preview_token:
         lines += ["", f"🖼️ [Podgląd kombinacji]({PUBLIC_URL}/preview/{session.preview_token})"]
+    if result.get("pack_token"):
+        lines += ["", f"🎫 **Twój token paczki:** `{result['pack_token']}` — "
+                      "unikalny podpis tej paczki (możesz podać go administracji serwera)."]
 
     embed = discord.Embed(
         title="✅ Twoja paczka jest gotowa!" if kind == "citizen" else "✅ Twoja paczka skinów jest gotowa!",
         description="\n".join(lines), color=C_GREEN, timestamp=datetime.now(timezone.utc),
     )
+    if profile is not None:
+        embed.set_footer(text=(f"Wygenerowano dla {profile.username or profile.user_id} • "
+                               f"{profile.rank['name']} (poziom {profile.level})"))
     await interaction.followup.send(embed=embed)
+
+    # --- Creator Economy: XP, odznaki, preferencje, historia ---
+    if profile is not None:
+        profile.builds += 1
+        if kind == "citizen":
+            profile.remember([tag for item in items for tag in tags_for_step(str(item.get("id", "")))])
+            groups = {step["group"] for step in session.chosen_steps()}
+            if len(groups) >= 6:
+                if profile.badge("wszechstronny"):
+                    await interaction.channel.send(f"🧩 Nowa odznaka: {BADGES['wszechstronny']}")
+        else:
+            profile.skins_picked += len(items)
+            profile.remember(["skiny-broni"] * len(items))
+            if profile.skins_picked >= 5 and profile.badge("zlota-bron"):
+                await interaction.channel.send(f"🔫 Nowa odznaka: {BADGES['zlota-bron']}")
+        profile.remember_build(build["id"])
+        if len(profile.builds_seen) >= 3 and profile.badge("zna-buildy"):
+            await interaction.channel.send(f"🎮 Nowa odznaka: {BADGES['zna-buildy']}")
+        profile.add_history({
+            "at": int(time.time()), "kind": kind, "build": build["id"],
+            "token": result.get("pack_token"),
+            "items": [str(i.get("id")) for i in items],
+        })
+        profile.badge("pierwsza-paczka")
+        if profile.builds >= 10:
+            profile.badge("konstruktor-10")
+        if profile.builds >= 25:
+            profile.badge("mistrz-25")
+        profiles_save()
+
+        await award_xp(profile, "build", interaction.channel, reason=f"paczka {kind}")
+        await award_xp(profile, "option", interaction.channel,
+                       amount=XP_EVENTS["option"] * len(items), reason="wybrane opcje")
+        await award_xp(profile, "session", interaction.channel, reason="zakończona sesja")
 
     # Publikacja na kanale #centrum-pobierania
     guild = interaction.guild
@@ -1292,10 +2466,16 @@ async def post_videos(bot: "FoundryBot", videos: Sequence[Dict[str, Any]]) -> in
 async def run_scan(bot: "FoundryBot", interaction: Optional[discord.Interaction] = None) -> None:
     """Pełny skan + publikacja (używane też przez /skanuj)."""
     try:
-        count = await post_videos(bot, await scan_videos())
+        videos = await scan_videos()
+        count = await post_videos(bot, videos)
         yt_log.info("Skan YouTube: %s nowych filmow.", count)
+        pings = await send_smart_pings(bot, videos)
+        if pings:
+            yt_log.info("Smart pingi: %s spersonalizowanych rekomendacji na priv.", pings)
         if interaction:
-            await interaction.followup.send(f"✅ Skan zakończony — wrzucono **{count}** nowych filmów.")
+            await interaction.followup.send(
+                f"✅ Skan zakończony — wrzucono **{count}** nowych filmów"
+                + (f", wysłano **{pings}** spersonalizowanych rekomendacji." if pings else "."))
     except Exception as exc:  # noqa: BLE001
         yt_log.error("Blad skanera: %s", exc)
         if interaction:
@@ -1457,35 +2637,72 @@ def short_group(group: str) -> str:
     return re.sub(r"^[^\s]+\s*", "", group).split("—")[0].strip()[:20]
 
 
-def step_embed(step: Dict[str, str], index: int, chosen: bool) -> discord.Embed:
-    """Embed jednego kroku kreatora citizena (ze zdjęciem efektu w grze)."""
+def page_count(total: int, per_page: int) -> int:
+    """Ile stron potrzeba dla danej liczby elementów (Discord: max 25 na select)."""
+    return max(1, (max(0, total) + per_page - 1) // per_page)
+
+
+def step_jump_options(index: int) -> List[discord.SelectOption]:
+    """
+    Opcje selecta „przeskocz do kroku”.
+
+    Discord pozwala na 25 opcji, więc przy większej liczbie kroków pokazujemy
+    okno STEPS_PER_PAGE wokół bieżącego kroku (paginacja zamiast ucięcia listy).
+    """
+    total = len(CITIZEN_STEPS)
+    if total <= 25:
+        indices = range(total)
+    else:
+        span = min(STEPS_PER_PAGE, 25)
+        start = max(0, min(index - span // 2, total - span))
+        indices = range(start, start + span)
+    return [opt(f"{short_group(CITIZEN_STEPS[i]['group'])}: {CITIZEN_STEPS[i]['name']}", str(i),
+                f"{i + 1}/{total}", default=(i == index)) for i in indices]
+
+
+def step_embed(step: Dict[str, str], index: int, chosen: bool, level: int = 99) -> discord.Embed:
+    """
+    Embed jednego kroku kreatora citizena (ze zdjęciem efektu w grze).
+
+    Presety ekskluzywne (EXCLUSIVE_STEPS) pokazują się z blokadą 🔒 dopóki
+    gracz nie zdobędzie wymaganego poziomu twórcy.
+    """
+    locked = level < min_level_of(step)
+    description = f"**{step['name']}**\n{step['description']}\n\n"
+    if locked:
+        description += lock_text(step)
+    elif chosen:
+        description += "✅ **Dodano do Twojej paczki.**"
+    else:
+        description += "⬜ *Nie dodano — kliknij „Dodaj do paczki'.*"
     embed = discord.Embed(
         title=f"{step['group']} — {index + 1}/{len(CITIZEN_STEPS)}",
-        description=(f"**{step['name']}**\n{step['description']}\n\n"
-                     + ("✅ **Dodano do Twojej paczki.**" if chosen
-                        else "⬜ *Nie dodano — kliknij „Dodaj do paczki'.*")),
-        color=C_GREEN if chosen else C_BLUE,
+        description=description,
+        color=C_YELLOW if locked else (C_GREEN if chosen else C_BLUE),
     )
     embed.set_image(url=step["image"])
-    embed.set_footer(text="Zdjęcie poglądowe efektu w grze • FiveM Mod Foundry")
+    embed.set_footer(text=(
+        "🔒 Preset ekskluzywny — zbuduj więcej paczek, aby odblokować" if locked
+        else "Zdjęcie poglądowe efektu w grze • FiveM Mod Foundry"))
     return embed
 
 
-def step_view(index: int, chosen: bool) -> discord.ui.View:
+def step_view(index: int, chosen: bool, locked: bool = False, level: int = 0) -> discord.ui.View:
     """Widok kroku: rząd przycisków + OSOBNY rząd select (Discord tego wymaga!)."""
+    if locked:
+        first = btn(f"citizen_locked:{index}", f"🔒 Wymaga poziomu {level}",
+                    discord.ButtonStyle.secondary)
+    else:
+        first = btn(f"citizen_add:{index}",
+                    "Dodano ✓ (kliknij, aby usunąć)" if chosen else "Dodaj do paczki",
+                    discord.ButtonStyle.success if chosen else discord.ButtonStyle.primary,
+                    "✅" if chosen else "➕")
     buttons = [
-        btn(f"citizen_add:{index}",
-            "Dodano ✓ (kliknij, aby usunąć)" if chosen else "Dodaj do paczki",
-            discord.ButtonStyle.success if chosen else discord.ButtonStyle.primary,
-            "✅" if chosen else "➕"),
+        first,
         btn(f"citizen_skip:{index}", "Pomiń", discord.ButtonStyle.secondary, "⏭️"),
         btn("citizen_summary", "Podsumowanie", discord.ButtonStyle.secondary, "📋"),
     ]
-    jump = select(
-        f"citizen_jump:{index}", "Przeskocz do innego kroku...",
-        [opt(f"{short_group(s['group'])}: {s['name']}", str(i), default=(i == index))
-         for i, s in enumerate(CITIZEN_STEPS)],
-    )
+    jump = select(f"citizen_jump:{index}", "Przeskocz do innego kroku...", step_jump_options(index))
     return LayoutView(buttons, [jump])
 
 
@@ -1568,7 +2785,11 @@ async def send_step(channel: discord.abc.Messageable, session: Session, index: i
         return
     step = CITIZEN_STEPS[index]
     chosen = step["id"] in session.choices
-    await channel.send(embed=step_embed(step, index, chosen), view=step_view(index, chosen))
+    profile = profile_by_id(session.user_id)
+    level = profile.level if profile else 0
+    locked = level < min_level_of(step)
+    await channel.send(embed=step_embed(step, index, chosen, level),
+                       view=step_view(index, chosen, locked, min_level_of(step)))
 
 
 async def send_summary(channel: discord.abc.Messageable, session: Session) -> None:
@@ -1592,37 +2813,81 @@ async def send_summary(channel: discord.abc.Messageable, session: Session) -> No
 # ============================================================================
 
 
-def skin_embed(weapon: Dict[str, Any], skin_index: int, session: Session) -> discord.Embed:
-    """Embed skina ze zdjęciem w grze."""
+def skin_page_of(index: int) -> int:
+    """Numer strony galerii (0-based) dla danego indeksu skina."""
+    return max(0, index) // SKINS_PER_PAGE
+
+
+def skin_embed(weapon: Dict[str, Any], skin_index: int, session: Session,
+               level: int = 99) -> discord.Embed:
+    """Embed skina ze zdjęciem w grze (z informacją o stronie galerii i blokadzie rangi)."""
     skin = weapon["skins"][skin_index]
     chosen = session.weapon_skins.get(weapon["id"]) == skin["id"]
+    locked = level < min_level_of(skin)
+    if locked:
+        status = lock_text(skin)
+    else:
+        status = "✅ **Ten skin jest w Twojej paczce.**" if chosen else "⬜ *Nie wybrano.*"
     embed = discord.Embed(
         title=f"🔫 {weapon['name']} — {skin['name']}",
-        description=(f"**{skin['name']}** — {skin['description']}\n\n"
-                     + ("✅ **Ten skin jest w Twojej paczce.**" if chosen else "⬜ *Nie wybrano.*")
+        description=(f"**{skin['name']}** — {skin['description']}\n\n" + status
                      + f"\n\n🎮 Build paczki: **{build_by_id(session.build_id)['name']}**"),
-        color=C_GREEN if chosen else C_PURPLE,
+        color=C_YELLOW if locked else (C_GREEN if chosen else C_PURPLE),
     )
     embed.set_image(url=skin["image"])
-    embed.set_footer(text="Realne zdjęcie skina nałożonego na broń • Weapon Skin Studio")
+    total_pages = page_count(len(weapon["skins"]), SKINS_PER_PAGE)
+    embed.set_footer(text=(f"Skin {skin_index + 1}/{len(weapon['skins'])} • strona "
+                           f"{skin_page_of(skin_index) + 1}/{total_pages} • "
+                           "zdjęcie skina nałożonego na broń"))
     return embed
 
 
 def skin_view(weapon: Dict[str, Any], skin_index: int, session: Session) -> discord.ui.View:
-    """Widok galerii skina: przyciski + osobny rząd select."""
-    skin = weapon["skins"][skin_index]
+    """
+    Widok galerii skina: przyciski + osobny rząd select + paginacja.
+
+    Discord pozwala na maks. 25 opcji w menu, więc przy większej liczbie skinów
+    lista jest dzielona na strony (SKINS_PER_PAGE), a gracz przełącza je
+    przyciskami — żaden skin nie jest ucinany.
+    """
+    skins = weapon["skins"]
+    skin_index = max(0, min(skin_index, len(skins) - 1))
+    skin = skins[skin_index]
     chosen = session.weapon_skins.get(weapon["id"]) == skin["id"]
+    page = skin_page_of(skin_index)
+    total_pages = page_count(len(skins), SKINS_PER_PAGE)
+    start = page * SKINS_PER_PAGE
+    end = min(start + SKINS_PER_PAGE, len(skins))
+    profile = profile_by_id(session.user_id)
+    level = profile.level if profile else 0
+    locked = level < min_level_of(skin)
+
     buttons = [
         btn(f"ws_prev:{weapon['id']}:{skin_index}", "◀ Wróć", discord.ButtonStyle.secondary),
-        btn(f"ws_choose:{weapon['id']}:{skin_index}",
-            "Wybrano ✓ (odznacz)" if chosen else "Wybierz ten skin",
-            discord.ButtonStyle.success if chosen else discord.ButtonStyle.primary, "✅"),
+        (btn(f"ws_locked:{weapon['id']}:{skin_index}", f"🔒 Wymaga poziomu {min_level_of(skin)}",
+             discord.ButtonStyle.secondary) if locked else
+         btn(f"ws_choose:{weapon['id']}:{skin_index}",
+             "Wybrano ✓ (odznacz)" if chosen else "Wybierz ten skin",
+             discord.ButtonStyle.success if chosen else discord.ButtonStyle.primary, "✅")),
         btn(f"ws_next:{weapon['id']}:{skin_index}", "Dalej ▶", discord.ButtonStyle.secondary),
     ]
-    picker = select(f"ws_skin_select:{weapon['id']}", "Wybierz skin z listy...",
-                    [opt(s["name"], str(i), s["description"], default=(i == skin_index))
-                     for i, s in enumerate(weapon["skins"])])
-    return LayoutView(buttons, [picker], skin_nav_row())
+    picker = select(f"ws_skin_select:{weapon['id']}",
+                    f"Wybierz skin z listy (strona {page + 1}/{total_pages})...",
+                    [opt(f"{'🔒 ' if level < min_level_of(skins[i]) else ''}{i + 1}. {skins[i]['name']}",
+                         str(i), skins[i]["description"], default=(i == skin_index))
+                     for i in range(start, end)])
+    rows: List[Any] = [buttons, [picker]]
+    page_buttons = []
+    if page > 0:
+        page_buttons.append(btn(f"ws_page:{weapon['id']}:{page - 1}",
+                                f"« Strona {page}/{total_pages}", discord.ButtonStyle.secondary))
+    if page < total_pages - 1:
+        page_buttons.append(btn(f"ws_page:{weapon['id']}:{page + 1}",
+                                f"Strona {page + 2}/{total_pages} »", discord.ButtonStyle.secondary))
+    if page_buttons:
+        rows.append(page_buttons)
+    rows.append(skin_nav_row())
+    return LayoutView(*rows)
 
 
 def skin_nav_row() -> List[discord.ui.Button]:
@@ -1705,18 +2970,62 @@ async def process_search_query(channel: discord.abc.Messageable, session: Sessio
         return
 
     session.search_results = results
+    session.search_query = query
+    await send_search_page(channel, session, page=0)
+
+    # Creator Economy: XP za korzystanie z wyszukiwarki (raz na frazę w sesji)
+    profile = profile_by_id(session.user_id)
+    if profile is not None:
+        query_key = query.strip().lower()
+        if query_key not in session.searches_awarded:
+            session.searches_awarded.append(query_key)
+            del session.searches_awarded[:-20]
+            profile.searches += 1
+            if profile.badge("odkrywca"):
+                await channel.send(f"🔎 Nowa odznaka: {BADGES['odkrywca']}")
+            await award_xp(profile, "search", channel, reason="wyszukiwarka .rpf")
+
+
+async def send_search_page(channel: discord.abc.Messageable, session: Session, page: int = 0) -> None:
+    """
+    Wyniki wyszukiwania .rpf z paginacją.
+
+    Menu Discorda ma limit 25 opcji, dlatego wyniki dzielone są na strony
+    (SEARCH_RESULTS_PER_PAGE), a przyciski przełączają strony bez powtarzania
+    zapytania do indeksu.
+    """
+    results = session.search_results
+    if not results:
+        return
+    total_pages = page_count(len(results), SEARCH_RESULTS_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+    session.search_page = page
+    start = page * SEARCH_RESULTS_PER_PAGE
+    end = min(start + SEARCH_RESULTS_PER_PAGE, len(results))
+
     description = "\n\n".join(
         f"**{i + 1}. {r.get('name', 'Skin')}** — {r.get('description') or 'bez opisu'}\n"
         f"Autor: {r.get('author') or '—'} • `{file_name_from_url(r.get('fileUrl', ''))}`"
-        for i, r in enumerate(results)
+        for i, r in enumerate(results[start:end], start=start)
     )
-    embed = discord.Embed(title=f"🔎 Wyniki dla: {query} ({len(results)})",
+    embed = discord.Embed(title=f"🔎 Wyniki dla: {session.search_query} ({len(results)})",
                           description=description, color=C_GREEN)
-    page = LayoutView([select("ws_search_pick", "Wybierz skin do paczki...",
+    embed.set_footer(text=(f"Strona {page + 1}/{total_pages} • wyniki {start + 1}-{end} "
+                           f"z {len(results)} • wybierz z menu poniżej"))
+    rows: List[Any] = [[select("ws_search_pick", "Wybierz skin do paczki (.rpf)...",
                               [opt(r.get("name", "Skin"), str(i),
                                    r.get("description") or "bez opisu")
-                               for i, r in enumerate(results)])])
-    await channel.send(embed=embed, view=page)
+                               for i, r in enumerate(results[start:end], start=start)])]]
+    page_buttons = []
+    if page > 0:
+        page_buttons.append(btn(f"ws_search_page:{page - 1}",
+                                f"« Poprzednie ({page}/{total_pages})", discord.ButtonStyle.secondary))
+    if page < total_pages - 1:
+        page_buttons.append(btn(f"ws_search_page:{page + 1}",
+                                f"Następne ({page + 2}/{total_pages}) »", discord.ButtonStyle.secondary))
+    if page_buttons:
+        rows.append(page_buttons)
+    await channel.send(embed=embed, view=LayoutView(*rows))
 
 
 async def send_skins_summary(channel: discord.abc.Messageable, session: Session) -> None:
@@ -2160,6 +3469,19 @@ async def handle_approval_button(interaction: discord.Interaction, custom_id: st
                      "Zgłoszenie bezpieczeństwa ZAAKCEPTOWANE" if approved else "Zgłoszenie bezpieczeństwa ODRZUCONE",
                      interaction.user, f"#{approval_id} — {approval.file_name}\n{approval.reason}\nURL: {approval.file_url}")
 
+    # Creator Economy: XP i odznaka dla administratora za ochronę społeczności
+    admin_profile = profile_get(interaction.user)
+    if admin_profile is not None:
+        admin_profile.reports += 1
+        await award_xp(admin_profile, "report", interaction.channel,
+                       reason="decyzja o pliku ryzykownym")
+        if not approved and admin_profile.badge("analityk"):
+            try:
+                await interaction.followup.send(f"🛡️ Nowa odznaka: {BADGES['analityk']}",
+                                                ephemeral=True)
+            except discord.HTTPException:
+                pass
+
     channel = interaction.guild.get_channel(approval.channel_id)
     if channel:
         message = (f"<@{approval.user_id}> ✅ Administrator **zezwolił** na plik `{approval.file_name}`. "
@@ -2184,10 +3506,20 @@ async def http_health(request: web.Request) -> web.Response:
 
 
 async def http_download(request: web.Request) -> web.StreamResponse:
-    """GET /download/<token> — paczka ZIP."""
-    package = STORAGE.get(request.match_info["token"])
+    """
+    GET /download/<token> — paczka ZIP.
+
+    Pobranie uruchamia Garbage Collector: paczka i workspace gracza zostaną
+    usunięte po DELETE_AFTER_DOWNLOAD_MINUTES (domyślnie 10 min), żeby dysk
+    VPS-a się nie zapychał.
+    """
+    token = request.match_info["token"]
+    package = STORAGE.get(token)
     if not package:
         return web.Response(text="404: Paczka nie istnieje lub wygasła.", status=404)
+    STORAGE.mark_downloaded(token)
+    http_log.info("Paczka %s pobierana przez HTTP (%s)", package["file_name"],
+                  request.remote or "?")
     return web.FileResponse(package["file_path"], headers={
         "Content-Disposition": f'attachment; filename="{package["file_name"]}"',
         "Content-Type": "application/zip",
@@ -2205,7 +3537,57 @@ async def http_preview(request: web.Request) -> web.Response:
 
 async def http_root(request: web.Request) -> web.Response:
     """GET / — informacja."""
-    return web.Response(text="FiveM Mod Foundry — bot działa. /health, /download/<token>, /preview/<token>")
+    return web.Response(text=("FiveM Mod Foundry — bot działa.\n"
+                             "/health • /download/<token> • /preview/<token>\n"
+                             "/api/pack/<token> • /api/profile/<discord_id> • /api/stats"))
+
+
+async def http_api_pack(request: web.Request) -> web.Response:
+    """
+    GET /api/pack/<token> — weryfikacja paczki dla serwera FiveM.
+
+    Zwraca metadane paczki i status podpisu HMAC. Mini-resource na serwerze
+    może tym sprawdzić, kto wygenerował paczkę (np. żeby nadać rangę w grze):
+      PerformHttpRequest(url .. "/api/pack/" .. token, cb, "GET")
+    """
+    record = pack_token_get(request.match_info["token"].strip().upper())
+    if not record:
+        return web.json_response({"ok": False, "error": "nieznany token"}, status=404)
+    return web.json_response({"ok": True, **record})
+
+
+async def http_api_profile(request: web.Request) -> web.Response:
+    """GET /api/profile/<discord_id> — publiczne podsumowanie profilu twórcy."""
+    try:
+        user_id = int(request.match_info["user_id"])
+    except ValueError:
+        return web.json_response({"ok": False, "error": "zły identyfikator"}, status=400)
+    profile = profile_by_id(user_id)
+    if profile is None:
+        return web.json_response({"ok": False, "error": "brak profilu"}, status=404)
+    payload = {
+        "ok": True, "user_id": profile.user_id, "username": profile.username,
+        "level": profile.level, "rank": profile.rank["name"], "xp": profile.xp,
+        "builds": profile.builds, "badges": [BADGES[b] for b in profile.badges if b in BADGES],
+    }
+    return web.json_response(payload)
+
+
+async def http_api_stats(request: web.Request) -> web.Response:
+    """GET /api/stats — statystyki bota (bez danych wrażliwych)."""
+    queue = ZIP_QUEUE.info()
+    return web.json_response({
+        "ok": True,
+        "creators": len(PROFILES),
+        "steps": len(CITIZEN_STEPS),
+        "weapons": len(all_weapons()),
+        "packs_issued": len(PACK_TOKENS),
+        "queue": {"waiting": queue["waiting"], "running": queue["running"],
+                  "completed": queue["completed"], "failed": queue["failed"]},
+        "cache": {"files": FILE_CACHE.stats()["files"],
+                  "hits": FILE_CACHE.stats()["hits"],
+                  "misses": FILE_CACHE.stats()["misses"]},
+    })
 
 
 def create_http_app() -> web.Application:
@@ -2214,6 +3596,9 @@ def create_http_app() -> web.Application:
     app.router.add_get("/health", http_health)
     app.router.add_get("/download/{token}", http_download)
     app.router.add_get("/preview/{token}", http_preview)
+    app.router.add_get("/api/pack/{token}", http_api_pack)
+    app.router.add_get("/api/profile/{user_id}", http_api_profile)
+    app.router.add_get("/api/stats", http_api_stats)
     app.router.add_get("/", http_root)
     return app
 
@@ -2222,6 +3607,106 @@ def create_http_app() -> web.Application:
 # ============================================================================
 
 ticket_log = log("Tickets")
+
+# ============================================================================
+# 22.5. GLOBALNA OBSŁUGA BŁĘDÓW (webhook + kanał administracji)
+# ============================================================================
+
+err_log = log("Errors")
+admin_log = log("Admin")
+ERROR_ID_CHARS = "0123456789abcdef"
+
+
+def new_error_id() -> str:
+    """Krótki kod błędu — gracz podaje go w zgłoszeniu, admin znajduje w logach."""
+    return "".join(random.choice(ERROR_ID_CHARS) for _ in range(6))
+
+
+async def notify_error(title: str, detail: str = "", exc: Optional[BaseException] = None,
+                       where: str = "", user: Optional[discord.abc.User] = None,
+                       color: int = C_RED) -> str:
+    """
+    Jedno miejsce na wszystkie błędy bota:
+      1. konsola + logs/bot.log,
+      2. webhook (ERROR_WEBHOOK_URL) — jeśli ustawiony,
+      3. embed na kanale #logi-system każdego serwera.
+    Zwraca kod błędu, który gracz może podać administracji.
+    """
+    eid = new_error_id()
+    trace = ""
+    if exc is not None:
+        trace = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))[-1500:]
+    err_log.error("[%s] %s | %s | %s\n%s", eid, title, where, detail, trace)
+
+    embed = discord.Embed(title=f"🚨 {title}", color=color,
+                          timestamp=datetime.now(timezone.utc),
+                          description=(detail or "—")[:2000])
+    embed.add_field(name="Kod błędu", value=f"`{eid}`", inline=True)
+    if where:
+        embed.add_field(name="Miejsce", value=f"`{where}`"[:1024], inline=True)
+    if user is not None:
+        embed.add_field(name="Użytkownik", value=f"{user} (`{getattr(user, 'id', '?')}`)", inline=True)
+    if exc is not None:
+        embed.add_field(name="Wyjątek",
+                        value=f"```{type(exc).__name__}: {str(exc)[:200]}```", inline=False)
+    if trace:
+        embed.add_field(name="Traceback (fragment)", value=f"```{trace[:1000]}```", inline=False)
+
+    await _deliver_admin_embed(embed)
+    return eid
+
+
+async def _deliver_admin_embed(embed: discord.Embed) -> None:
+    """Wysyła embed na webhook (jeśli ustawiony) i na kanał #logi-system każdego serwera."""
+    if ERROR_WEBHOOK_URL:
+        try:
+            async with aiohttp.ClientSession() as http:
+                await http.post(ERROR_WEBHOOK_URL, timeout=aiohttp.ClientTimeout(total=10),
+                                json={"username": "FiveM Mod Foundry", "embeds": [embed.to_dict()]})
+        except Exception as webhook_exc:  # noqa: BLE001
+            err_log.warning("Webhook nie zadziałał: %s", webhook_exc)
+    try:
+        for guild in (bot.guilds if bot else []):
+            channel = await get_admin_log_channel(guild)
+            if channel:
+                await channel.send(embed=embed)
+    except Exception as log_exc:  # noqa: BLE001
+        err_log.warning("Nie wysłano powiadomienia na kanał: %s", log_exc)
+
+
+async def notify_admin(title: str, detail: str = "", color: int = C_BLUE) -> None:
+    """Powiadomienie (nie błąd) na kanał administracji + webhook: np. 'bot wstał'."""
+    admin_log.info("[ADMIN] %s | %s", title, detail)
+    embed = discord.Embed(title=title, description=(detail or "—")[:2000], color=color,
+                          timestamp=datetime.now(timezone.utc))
+    await _deliver_admin_embed(embed)
+
+
+async def report_user_error(interaction: discord.Interaction, exc: BaseException, where: str) -> None:
+    """Czytelny komunikat dla gracza + automatyczne zgłoszenie dla administracji."""
+    eid = await notify_error(f"Błąd obsługi: {where}", f"Komenda/akcja: `{where}`", exc, where,
+                             getattr(interaction, "user", None))
+    message = (f"😔 **Ups, coś poszło nie tak** (`{where}`).\n"
+               "Nic nie zostało zepsute — spróbuj ponownie lub kliknij przycisk raz jeszcze.\n"
+               f"Jeśli problem wraca, zgłoś administracji kod błędu: `{eid}`")
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except discord.HTTPException:
+        pass
+
+
+def handle_loop_exception(loop: asyncio.AbstractEventLoop, context: Dict[str, Any]) -> None:
+    """Łapie wyjątki zadań w tle (np. pętli skanera), żeby bot nie umarł po cichu."""
+    exc = context.get("exception")
+    message = context.get("message") or "nieznany błąd pętli zdarzeń"
+    err_log.error("Wyjątek pętli: %s (%s)", message, exc)
+    try:
+        asyncio.create_task(notify_error("Wyjątek w zadaniu w tle", str(message), exc, "asyncio"))
+    except RuntimeError:
+        pass
 
 
 class FoundryBot(discord.Client):
@@ -2251,9 +3736,17 @@ class FoundryBot(discord.Client):
         except discord.HTTPException as exc:
             core_log.error("Blad rejestracji komend: %s", exc)
 
-        # 3. Zadania w tle
+        # 3. Globalny łapacz wyjątków zadań w tle
+        asyncio.get_running_loop().set_exception_handler(handle_loop_exception)
+
+        # 3.5. Profile twórców i tokeny paczek (Creator Economy)
+        profiles_load()
+        packs_load()
+
+        # 4. Zadania w tle
         asyncio.create_task(scanner_loop(self))
         asyncio.create_task(sweeper_loop(self))
+        asyncio.create_task(precache_items())          # zapas plików = natychmiastowe paczki
 
     async def on_ready(self) -> None:
         core_log.info("Zalogowano jako %s", self.user)
@@ -2273,8 +3766,22 @@ class FoundryBot(discord.Client):
             try:
                 await setup_guild(guild)
             except Exception as exc:  # noqa: BLE001
+                await notify_error("Błąd konfiguracji serwera", f"Serwer: {guild.name} ({guild.id})",
+                                   exc, "setup_guild")
                 core_log.error("Setup %s: %s", guild.name, exc)
+
+        cache = FILE_CACHE.stats()
+        core_log.info("Cache: %s plików, %.1f MB (hity: %s, pobrania: %s)",
+                      cache["files"], cache["bytes"] / 1024 / 1024, cache["hits"], cache["misses"])
         core_log.info("✅ Bot gotowy.")
+        await notify_admin(
+            "🟢 Bot uruchomiony",
+            (f"Serwery: **{len(self.guilds)}** • Opcje citizena: **{len(CITIZEN_STEPS)}** "
+             f"• Broni w bazie: **{len(all_weapons())}**\n"
+             f"Kolejka ZIP: **{ZIP_QUEUE.concurrency_limit}** równolegle • "
+             f"Cache plików: **{cache['files']}** ({cache['bytes'] / 1024 / 1024:.1f} MB)\n"
+             f"Paczki: **{STORAGE.stats()['packages']}** • Podglądy: **{STORAGE.stats()['previews']}**"),
+            C_GREEN)
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
         try:
@@ -2282,6 +3789,15 @@ class FoundryBot(discord.Client):
             core_log.info("Dołączono i skonfigurowano %s", guild.name)
         except Exception as exc:  # noqa: BLE001
             core_log.error("Setup nowego serwera: %s", exc)
+            await notify_error("Błąd setupu nowego serwera", f"Serwer: {guild.name} ({guild.id})",
+                               exc, "on_guild_join")
+
+    async def on_error(self, event_method: str, /, *args: Any, **kwargs: Any) -> None:
+        """Łapie błędy zdarzeń discord.py (np. on_message) i raportuje je administracji."""
+        exc = sys.exc_info()[1]
+        err_log.error("Błąd zdarzenia %s: %s", event_method, exc, exc_info=True)
+        await notify_error(f"Błąd zdarzenia `{event_method}`", "Zdarzenie Discorda zgłosiło wyjątek.",
+                           exc, event_method)
 
     # -------------------------------------------------------- wiadomości (.rpf)
     async def on_message(self, message: discord.Message) -> None:
@@ -2300,7 +3816,14 @@ class FoundryBot(discord.Client):
         try:
             await process_search_query(message.channel, session, query)
         except Exception as exc:  # noqa: BLE001
-            core_log.error("Blad wyszukiwarki: %s", exc)
+            eid = await notify_error("Błąd wyszukiwarki skinów", f"Fraza: `{query[:80]}`", exc,
+                                     "process_search_query", message.author)
+            try:
+                await message.channel.send(
+                    f"😔 Wyszukiwarka nie odpowiedziała poprawnie. Spróbuj ponownie "
+                    f"lub wpisz inną frazę (kod: `{eid}`).", delete_after=30)
+            except discord.HTTPException:
+                pass
 
     # ------------------------------------------------------------------ router
     async def on_interaction(self, interaction: discord.Interaction) -> None:
@@ -2334,6 +3857,9 @@ class FoundryBot(discord.Client):
             # --- akcje bez sesji ---
             if custom_id == "take_role":
                 await handle_take_role(interaction)
+                return
+            if custom_id == "settings_toggle_dm":
+                await handle_settings_toggle(interaction)
                 return
             if custom_id == "create_citizen":
                 await create_ticket(interaction, "citizen")
@@ -2380,16 +3906,24 @@ class FoundryBot(discord.Client):
                 return
 
             # --- przyciski/selecty kreatora citizena ---
-            if custom_id.startswith("citizen_add:"):
+            if custom_id.startswith(("citizen_add:", "citizen_locked:")):
                 index = int(custom_id.split(":", 1)[1])
                 step = CITIZEN_STEPS[index]
+                profile = profile_by_id(session.user_id)
+                level = profile.level if profile else 0
+                if level < min_level_of(step):
+                    await interaction.response.send_message(
+                        f"{lock_text(step)}\n\nTwój poziom: **{level}** • XP: "
+                        f"**{profile.xp if profile else 0}** — buduj paczki i oceniaj mody "
+                        "(`/profil`, `/top`).", ephemeral=True)
+                    return
                 if step["id"] in session.choices:
                     session.choices.remove(step["id"])
                 else:
                     session.choices.append(step["id"])
                 chosen = step["id"] in session.choices
-                await interaction.response.edit_message(embed=step_embed(step, index, chosen),
-                                                       view=step_view(index, chosen))
+                await interaction.response.edit_message(embed=step_embed(step, index, chosen, level),
+                                                       view=step_view(index, chosen, False))
                 return
 
             if custom_id.startswith("citizen_skip:"):
@@ -2441,8 +3975,15 @@ class FoundryBot(discord.Client):
                     await interaction.response.defer()
                     return
                 index = int(values[0])
-                session.weapon_skins[weapon["id"]] = weapon["skins"][index]["id"]
-                await interaction.response.edit_message(embed=skin_embed(weapon, index, session),
+                skin = weapon["skins"][index]
+                profile = profile_by_id(session.user_id)
+                level = profile.level if profile else 0
+                if level < min_level_of(skin):
+                    await interaction.response.send_message(
+                        f"{lock_text(skin)}\n\nTwój poziom: **{level}**.", ephemeral=True)
+                    return
+                session.weapon_skins[weapon["id"]] = skin["id"]
+                await interaction.response.edit_message(embed=skin_embed(weapon, index, session, level),
                                                        view=skin_view(weapon, index, session))
                 return
 
@@ -2459,7 +4000,26 @@ class FoundryBot(discord.Client):
                                                        view=skin_view(weapon, index, session))
                 return
 
-            if custom_id.startswith("ws_choose:"):
+            if custom_id.startswith("ws_page:"):
+                _action, weapon_id, page_str = custom_id.split(":")
+                weapon = find_weapon(weapon_id)
+                if not weapon:
+                    await interaction.response.defer()
+                    return
+                total_pages = page_count(len(weapon["skins"]), SKINS_PER_PAGE)
+                page = max(0, min(int(page_str), total_pages - 1))
+                index = page * SKINS_PER_PAGE
+                chosen_id = session.weapon_skins.get(weapon["id"])
+                if chosen_id:
+                    for i, skin in enumerate(weapon["skins"]):
+                        if skin["id"] == chosen_id and skin_page_of(i) == page:
+                            index = i
+                            break
+                await interaction.response.edit_message(embed=skin_embed(weapon, index, session),
+                                                       view=skin_view(weapon, index, session))
+                return
+
+            if custom_id.startswith(("ws_choose:", "ws_locked:")):
                 _action, weapon_id, index_str = custom_id.split(":")
                 weapon = find_weapon(weapon_id)
                 if not weapon:
@@ -2467,6 +4027,13 @@ class FoundryBot(discord.Client):
                     return
                 index = int(index_str)
                 skin = weapon["skins"][index]
+                profile = profile_by_id(session.user_id)
+                level = profile.level if profile else 0
+                if level < min_level_of(skin):
+                    await interaction.response.send_message(
+                        f"{lock_text(skin)}\n\nTwój poziom: **{level}** — ekskluzywne skiny "
+                        "odblokowują się wraz z rangą twórcy.", ephemeral=True)
+                    return
                 if session.weapon_skins.get(weapon["id"]) == skin["id"]:
                     session.weapon_skins.pop(weapon["id"], None)
                 else:
@@ -2516,6 +4083,38 @@ class FoundryBot(discord.Client):
                 await interaction.response.send_message(embed=embed, ephemeral=True)
                 return
 
+            if custom_id.startswith("ws_search_page:"):
+                page = int(custom_id.split(":", 1)[1])
+                await interaction.response.defer()
+                await send_search_page(interaction.channel, session, page=page)
+                return
+
+            if custom_id.startswith("ws_quick_add:"):
+                _action, weapon_id, index_str = custom_id.split(":")
+                weapon = find_weapon(weapon_id)
+                if not weapon:
+                    await interaction.response.defer()
+                    return
+                index = max(0, min(int(index_str), len(weapon["skins"]) - 1))
+                skin = weapon["skins"][index]
+                profile = profile_by_id(session.user_id)
+                level = profile.level if profile else 0
+                if level < min_level_of(skin):
+                    await interaction.response.send_message(
+                        f"{lock_text(skin)}\n\nTwój poziom: **{level}**.", ephemeral=True)
+                    return
+                already = session.weapon_skins.get(weapon["id"]) == skin["id"]
+                if already:
+                    session.weapon_skins.pop(weapon["id"], None)
+                else:
+                    session.weapon_skins[weapon["id"]] = skin["id"]
+                await interaction.response.send_message(
+                    ("♻️ Usunięto z paczki: " if already else "✅ Dodano do paczki: ")
+                    + f"**{weapon['name']} — {skin['name']}**\n"
+                    "Paczkę zbudujesz przyciskiem **📦 Zakończ i zbuduj paczkę** w galerii.",
+                    ephemeral=True)
+                return
+
             if custom_id == "ws_summary":
                 await interaction.response.defer()
                 await send_skins_summary(interaction.channel, session)
@@ -2528,16 +4127,9 @@ class FoundryBot(discord.Client):
                 return
 
         except Exception as exc:  # noqa: BLE001
-            core_log.error("Blad interakcji (%s): %s", custom_id if "custom_id" in locals() else "?", exc,
-                           exc_info=True)
-            try:
-                payload = {"content": "❌ Wystąpił błąd.", "ephemeral": True}
-                if interaction.response.is_done():
-                    await interaction.followup.send(**payload)
-                else:
-                    await interaction.response.send_message(**payload)
-            except discord.HTTPException:
-                pass
+            where = locals().get("custom_id") or "interakcja"
+            core_log.error("Blad interakcji (%s): %s", where, exc, exc_info=True)
+            await report_user_error(interaction, exc, str(where))
 
 
 bot = FoundryBot()
@@ -2559,6 +4151,30 @@ async def handle_take_role(interaction: discord.Interaction) -> None:
     except discord.Forbidden:
         await interaction.response.send_message(
             "❌ Bot nie ma uprawnień (przesuń jego rolę wyżej w hierarchii).", ephemeral=True)
+
+
+async def handle_settings_toggle(interaction: discord.Interaction) -> None:
+    """Przycisk w /ustawienia — włącz/wyłącz rekomendacje modów na priv."""
+    profile = profile_get(interaction.user)
+    if profile is None:
+        await interaction.response.send_message("❌ Nie udało się wczytać profilu.", ephemeral=True)
+        return
+    profile.dm_opt_in = not profile.dm_opt_in
+    profiles_save()
+    state = "włączone ✅" if profile.dm_opt_in else "wyłączone ⛔"
+    label = "⛔ Wyłącz rekomendacje na priv" if profile.dm_opt_in else "✅ Włącz rekomendacje na priv"
+    embed = discord.Embed(
+        title="⚙️ Ustawienia zaktualizowane",
+        description=(f"Rekomendacje modów na priv: **{state}**\n\n"
+                     + ("Bot będzie podsyłać mody dopasowane do Twoich wyborów."
+                        if profile.dm_opt_in else
+                        "Bot nie będzie już wysyłać Ci wiadomości prywatnych.")),
+        color=C_GREEN if profile.dm_opt_in else C_YELLOW)
+    await interaction.response.edit_message(
+        embed=embed,
+        view=LayoutView([btn("settings_toggle_dm", label,
+                             discord.ButtonStyle.secondary if profile.dm_opt_in
+                             else discord.ButtonStyle.success)]))
 
 
 async def close_session(bot_instance: FoundryBot, session: Session, reason: str) -> None:
@@ -2619,6 +4235,15 @@ async def create_ticket(interaction: discord.Interaction, start_mode: str) -> No
     session = session_create(user.id, guild.id, channel.id)
     session.mode = start_mode
     session.build_id = DEFAULT_BUILD_ID
+
+    # Creator Economy: profil, codzienne XP, ranga
+    profile = profile_get(user)
+    if profile is not None:
+        daily = profile.touch_day()
+        profiles_save()
+        if daily:
+            await award_xp(profile, "daily", channel, reason="pierwsza aktywność dnia")
+
     await interaction.followup.send(f"✅ Twój prywatny kanał: {channel.mention}")
 
     embed = discord.Embed(
@@ -2634,6 +4259,14 @@ async def create_ticket(interaction: discord.Interaction, start_mode: str) -> No
                      f"Przerwij: `/zamknij` lub przycisk 🔒 (auto-zamknięcie po "
                      f"{CHANNEL_CLEANUP_MINUTES} min od wygenerowania paczki)."),
         color=C_GREEN)
+    if profile is not None:
+        embed.add_field(name="🏅 Twoja ranga twórcy", value=profile.progress_line(), inline=False)
+        locked = [s for s in CITIZEN_STEPS if profile.level < min_level_of(s)]
+        if locked:
+            names = ", ".join(s["name"].split(" (")[0] for s in locked[:4])
+            embed.add_field(name=f"🔒 Ekskluzywne presety ({len(locked)})",
+                            value=f"Czekają na wyższy poziom: {names}…\n"
+                                  "Buduj paczki, aby zdobyć XP — szczegóły: `/profil`", inline=False)
     await channel.send(content=user.mention, embed=embed,
                        view=ticket_view(session, with_mode=(start_mode != "weapons")))
 
@@ -2808,6 +4441,8 @@ async def sweeper_loop(bot_instance: FoundryBot) -> None:
                     await close_session(bot_instance, session, "Sesja wygasła (bezczynność)")
         except Exception as exc:  # noqa: BLE001
             core_log.error("Blad sweepera: %s", exc)
+            await notify_error("Błąd pętli sprzątania", "Garbage collector zgłosił wyjątek.", exc,
+                               "sweeper_loop")
         await asyncio.sleep(120)
 
 # ============================================================================
@@ -2842,6 +4477,88 @@ async def cmd_panel_skins(interaction: discord.Interaction) -> None:
             btn("create_weapon_skins", "Stwórz skiny broni", discord.ButtonStyle.primary, "🔫")]))
 
 
+async def skin_autocomplete(interaction: discord.Interaction,
+                           current: str) -> List[app_commands.Choice[str]]:
+    """Autocomplete skinów broni — szukanie w locie bez wpisywania pełnej nazwy."""
+    needle = (current or "").strip().lower()
+    choices: List[app_commands.Choice[str]] = []
+    for weapon in all_weapons():
+        for index, skin in enumerate(weapon["skins"]):
+            label = f"{weapon['name']} — {skin['name']}"
+            haystack = f"{label} {weapon['id']} {skin['id']} {skin['description']}".lower()
+            if needle and needle not in haystack:
+                continue
+            choices.append(app_commands.Choice(name=label[:100], value=f"{weapon['id']}:{index}"))
+            if len(choices) >= 25:
+                return choices
+    return choices
+
+
+@bot.tree.command(name="skin", description="Znajdź skin broni z podglądem (autocomplete)")
+@app_commands.describe(skin="Zacznij pisać nazwę broni lub skina (np. ak47, chrome)...")
+@app_commands.autocomplete(skin=skin_autocomplete)
+async def cmd_skin(interaction: discord.Interaction, skin: str) -> None:
+    """Szybkie znalezienie skina: podgląd + jednym klikiem dodanie do paczki."""
+    try:
+        weapon_id, index_str = skin.split(":", 1)
+        index = int(index_str)
+    except ValueError:
+        await interaction.response.send_message("❌ Wybierz skin z listy podpowiedzi.", ephemeral=True)
+        return
+    weapon = find_weapon(weapon_id)
+    if not weapon or not 0 <= index < len(weapon["skins"]):
+        await interaction.response.send_message("❌ Nie znaleziono tego skina.", ephemeral=True)
+        return
+    chosen = weapon["skins"][index]
+    session = session_get(interaction.channel_id)
+    embed = discord.Embed(
+        title=f"🔫 {weapon['name']} — {chosen['name']}",
+        description=(f"{chosen['description']}\n\n"
+                     f"**Plik:** `{chosen['file_name']}`\n"
+                     f"**Lokalizacja w grze:** `{chosen['target']}`"),
+        color=C_PURPLE)
+    embed.set_image(url=chosen["image"])
+    view: Optional[discord.ui.View] = None
+    if session and session.user_id == interaction.user.id:
+        embed.set_footer(text="Kliknij poniżej, aby dodać tego skina do swojej paczki.")
+        view = LayoutView([btn(f"ws_quick_add:{weapon['id']}:{index}", "➕ Dodaj do mojej paczki",
+                               discord.ButtonStyle.success)])
+    else:
+        embed.set_footer(text="Otwórz kreatora (/panel), aby zbudować paczkę z tym skinem.")
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+async def step_autocomplete(interaction: discord.Interaction,
+                           current: str) -> List[app_commands.Choice[str]]:
+    """Autocomplete kroków kreatora citizena (nazwa opcji lub grupa)."""
+    needle = (current or "").strip().lower()
+    choices: List[app_commands.Choice[str]] = []
+    for index, step in enumerate(CITIZEN_STEPS):
+        label = f"{short_group(step['group'])}: {step['name']}"
+        if needle and needle not in f"{label} {step['description']}".lower():
+            continue
+        choices.append(app_commands.Choice(name=label[:100], value=str(index)))
+        if len(choices) >= 25:
+            break
+    return choices
+
+
+@bot.tree.command(name="krok", description="Przeskocz do wybranego kroku kreatora citizena (autocomplete)")
+@app_commands.describe(krok="Zacznij pisać nazwę opcji (np. cienie, potato, krew)...")
+@app_commands.autocomplete(krok=step_autocomplete)
+async def cmd_step(interaction: discord.Interaction, krok: str) -> None:
+    """Skok do konkretnego kroku w aktywnej sesji — zamiast klikać „Pomiń” 20 razy."""
+    session = session_get(interaction.channel_id)
+    if not session or session.user_id != interaction.user.id:
+        await interaction.response.send_message(
+            "❌ Ta komenda działa w Twoim prywatnym kanale sesji (otwórz go przyciskiem w /panel).",
+            ephemeral=True)
+        return
+    index = max(0, min(int(krok), len(CITIZEN_STEPS) - 1))
+    await interaction.response.defer()
+    await send_step(interaction.channel, session, index)
+
+
 @bot.tree.command(name="skanuj", description="Wymusza skan najnowszych modów z YouTube")
 @app_commands.default_permissions(administrator=True)
 async def cmd_scan(interaction: discord.Interaction) -> None:
@@ -2866,19 +4583,221 @@ async def cmd_close(interaction: discord.Interaction) -> None:
 async def cmd_status(interaction: discord.Interaction) -> None:
     """Statystyki bota."""
     stats = STORAGE.stats()
+    cache = FILE_CACHE.stats()
+    disk = STORAGE.disk_usage()
+    queue = ZIP_QUEUE.info()
+    megabytes = lambda value: f"{value / 1024 / 1024:.1f} MB"  # noqa: E731
     embed = discord.Embed(
         title="📊 Status FiveM Mod Foundry",
-        description=(f"⚙️ Kolejka ZIP: **{ZIP_QUEUE.completed}** zadań wykonanych, "
-                     f"**{ZIP_QUEUE.failed}** nieudanych\n"
-                     f"📦 Paczki aktywne: **{stats['packages']}**\n"
-                     f"🖼️ Podglądy aktywne: **{stats['previews']}**\n"
+        description=(f"⚙️ **Kolejka ZIP:** {queue['completed']} wykonanych, {queue['failed']} nieudanych "
+                     f"• teraz {queue['running']}/{queue['concurrency']}, czeka {queue['waiting']}\n"
+                     f"📦 Paczki aktywne: **{stats['packages']}** • podglądy: **{stats['previews']}**\n"
                      f"👥 Sesje aktywne: **{len(SESSIONS)}**\n"
                      f"🔐 Zgłoszenia bezpieczeństwa: **{len(approvals_pending())}** oczekujących\n"
                      f"🎮 Docelowy build: **{build_by_id(DEFAULT_BUILD_ID)['name']}**\n"
-                     f"🧩 Opcji citizena: **{len(CITIZEN_STEPS)}**\n"
-                     f"🔫 Broni w bazie: **{len(all_weapons())}** ({len(WEAPON_CATEGORIES)} kategorie)"),
+                     f"🧩 Opcji citizena: **{len(CITIZEN_STEPS)}** • "
+                     f"🔫 broni: **{len(all_weapons())}** ({len(WEAPON_CATEGORIES)} kategorie)\n\n"
+                     f"🗃️ **Cache plików:** {cache['files']} plików ({megabytes(cache['bytes'])}) — "
+                     f"hity: {cache['hits']}, pobrania: {cache['misses']}\n"
+                     f"🏅 **Twórcy (XP):** {len(PROFILES)} profili • "
+                     f"tokeny paczek: **{len(PACK_TOKENS)}** • priorytetowe zadania: "
+                     f"{queue['priority_jobs']}\n"
+                     f"🧹 **Dysk:** paczki {megabytes(disk['downloads'])}, "
+                     f"sesje {megabytes(disk['workspaces'])}, cache {megabytes(disk['cache'])}, "
+                     f"logi {megabytes(disk['logs'])}\n"
+                     f"♻️ GC: {stats['gc_runs']} cykli, usunięto {stats['deleted']} paczek "
+                     f"({megabytes(stats['freed_bytes'])} zwolnione)"),
         color=C_BLUE)
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="profil", description="Twój profil twórcy: ranga, XP, odznaki i preferencje")
+@app_commands.describe(uzytkownik="Sprawdź profil innego gracza (opcjonalnie)")
+async def cmd_profile(interaction: discord.Interaction,
+                      uzytkownik: Optional[discord.Member] = None) -> None:
+    """Profil twórcy — XP, ranga, odznaki, preferencje i historia paczek."""
+    target = uzytkownik or interaction.user
+    profile = profile_get(target)
+    if profile is None:
+        await interaction.response.send_message("❌ Nie udało się wczytać profilu.", ephemeral=True)
+        return
+    profiles_save()
+    next_rank = profile.next_rank()
+    embed = discord.Embed(
+        title=f"🏅 Profil twórcy — {target.display_name if hasattr(target, 'display_name') else target}",
+        description=profile.progress_line(), color=C_PURPLE)
+    embed.add_field(name="📊 Statystyki", inline=True, value=(
+        f"📦 Paczki: **{profile.builds}**\n"
+        f"🔫 Skiny: **{profile.skins_picked}**\n"
+        f"🔎 Szukania .rpf: **{profile.searches}**\n"
+        f"🛡️ Zgłoszenia: **{profile.reports}**"))
+    embed.add_field(name="🎯 Twoje preferencje", inline=False, value=(
+        ", ".join(f"{tag} ({count})" for tag, count in
+                  sorted(profile.preferences.items(), key=lambda kv: kv[1], reverse=True)[:5])
+        or "*jeszcze brak — zbuduj pierwszą paczkę*"))
+    embed.add_field(name="🏆 Odznaki", value=profile.badges_text(), inline=False)
+    if next_rank:
+        embed.add_field(name="🔓 Następna ranga", value=(
+            f"**{next_rank['name']}** przy {next_rank['xp']} XP\n{next_rank['perk']}"), inline=False)
+    if profile.history:
+        last = profile.history[0]
+        when = datetime.fromtimestamp(last.get("at", 0), timezone.utc)
+        embed.add_field(name="🕒 Ostatnia paczka", value=(
+            f"`{last.get('kind')}` • build `{last.get('build')}` • "
+            f"{len(last.get('items') or [])} pozycji • <t:{int(when.timestamp())}:R>"), inline=False)
+    dm_state = "włączone" if profile.dm_opt_in else "wyłączone"
+    embed.set_footer(text=f"Rekomendacje modów na priv: {dm_state} • zmień komendą /ustawienia")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="top", description="Ranking twórców — kto zbudował najwięcej paczek")
+async def cmd_top(interaction: discord.Interaction) -> None:
+    """Top 10 twórców według XP."""
+    profiles_load()
+    ranking = sorted(PROFILES.values(), key=lambda p: p.xp, reverse=True)[:10]
+    if not ranking:
+        await interaction.response.send_message("📭 Ranking jest pusty — bądź pierwszy!",
+                                                ephemeral=True)
+        return
+    lines = []
+    for index, profile in enumerate(ranking, start=1):
+        medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(index, f"**{index}.**")
+        lines.append(f"{medal} <@{profile.user_id}> — **{profile.rank['name']}** "
+                     f"(poziom {profile.level}, {profile.xp} XP, {profile.builds} paczek)")
+    embed = discord.Embed(title="🏆 Ranking twórców Foundry",
+                          description="\n".join(lines), color=C_YELLOW)
+    embed.set_footer(text="XP zdobywasz za budowanie paczek, wybory w kreatorze, wyszukiwanie i zgłoszenia")
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="ustawienia", description="Ustawienia profilu: rekomendacje modów na priv")
+async def cmd_settings(interaction: discord.Interaction) -> None:
+    """Panel ustawień twórcy (np. wyłączenie smart pingów)."""
+    profile = profile_get(interaction.user)
+    if profile is None:
+        await interaction.response.send_message("❌ Nie udało się wczytać profilu.", ephemeral=True)
+        return
+    profiles_save()
+    state = "włączone ✅" if profile.dm_opt_in else "wyłączone ⛔"
+    embed = discord.Embed(
+        title="⚙️ Twoje ustawienia twórcy",
+        description=(f"**Rekomendacje modów na priv:** {state}\n\n"
+                     "Bot pamięta Twoje wybory w kreatorze (np. POTATO + optymalizacja, "
+                     "krew anime, dźwięki bass) i gdy skaner YouTube znajdzie nowy mod "
+                     "pasujący do Twojego stylu — wyśle Ci go na priv.\n\n"
+                     "Zmienisz to przyciskiem poniżej (`/profil` pokaże Twoje preferencje)."),
+        color=C_BLUE)
+    label = "⛔ Wyłącz rekomendacje na priv" if profile.dm_opt_in else "✅ Włącz rekomendacje na priv"
+    await interaction.response.send_message(
+        embed=embed, ephemeral=True,
+        view=LayoutView([btn("settings_toggle_dm", label,
+                             discord.ButtonStyle.secondary if profile.dm_opt_in
+                             else discord.ButtonStyle.success)]))
+
+
+@bot.tree.command(name="xp", description="Nadaj lub odejmij XP twórcy (admin)")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(uzytkownik="Gracz", ilosc="Ile XP dodać (może być ujemne)", powod="Powód")
+async def cmd_xp(interaction: discord.Interaction, uzytkownik: discord.Member,
+                 ilosc: app_commands.Range[int, -5000, 5000], powod: str = "korekta administracji") -> None:
+    """Ręczna korekta XP (np. za pomoc w społeczności)."""
+    profile = profile_get(uzytkownik)
+    if profile is None:
+        await interaction.response.send_message("❌ Nie udało się wczytać profilu.", ephemeral=True)
+        return
+    message = profile.add_xp("manual", amount=int(ilosc))
+    profile.reports += 1 if ilosc < 0 else 0
+    profiles_save()
+    await system_log(interaction.guild, "Korekta XP", interaction.user,
+                     f"{uzytkownik} ({uzytkownik.id}): {ilosc:+} XP — {powod}")
+    text = (f"✅ {uzytkownik.mention}: **{ilosc:+} XP** — {powod}\n"
+            f"Teraz: **{profile.xp} XP** (ranga {profile.rank['name']}, poziom {profile.level})")
+    if message:
+        text += f"\n{message}"
+    await interaction.response.send_message(text)
+
+
+@bot.tree.command(name="pakiet", description="Sprawdź token paczki (kto ją wygenerował) — admin")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(token="Token z paczki, np. FM-1A2B3C4D")
+async def cmd_pack_lookup(interaction: discord.Interaction, token: str) -> None:
+    """Weryfikacja pochodzenia paczki po tokenie (podpis HMAC)."""
+    record = pack_token_get(token.strip().upper())
+    if not record:
+        await interaction.response.send_message("❌ Nie znam takiego tokenu paczki.", ephemeral=True)
+        return
+    items = record.get("items") or []
+    embed = discord.Embed(
+        title=f"🎫 Token {record['token']}",
+        description=("✅ Podpis zgodny — paczka pochodzi z tego bota." if record.get("valid")
+                     else "⛔ **Podpis niezgodny** — token został zmodyfikowany!"),
+        color=C_GREEN if record.get("valid") else C_RED)
+    embed.add_field(name="Twórca", value=f"<@{record.get('user_id')}> (`{record.get('user_id')}`)")
+    embed.add_field(name="Ranga", value=f"{record.get('rank')} (poziom {record.get('level')})")
+    embed.add_field(name="Typ / build", value=f"{record.get('kind')} • `{record.get('build')}`")
+    embed.add_field(name="Pozycje", value="\n".join(f"• {i.get('name')}" for i in items[:10]) or "—")
+    embed.add_field(name="Utworzono", value=f"<t:{record.get('created_at')}:R>")
+    embed.set_footer(text="Ten sam wynik zwraca API: /api/pack/<token>")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="cache", description="Cache plików bazowych: status, zapas, czyszczenie (admin)")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(akcja="Co zrobić z cache plików")
+@app_commands.choices(akcja=[
+    app_commands.Choice(name="Status cache", value="status"),
+    app_commands.Choice(name="Pobierz zapas plików (szybsze paczki)", value="prefetch"),
+    app_commands.Choice(name="Wyczyść cache", value="clear"),
+])
+async def cmd_cache(interaction: discord.Interaction, akcja: app_commands.Choice[str]) -> None:
+    """Zarządzanie lokalnym cache plików bazowych (bez ponownego pobierania z netu)."""
+    await interaction.response.defer(ephemeral=True)
+    if akcja.value == "clear":
+        freed = FILE_CACHE.clear()
+        await system_log(interaction.guild, "Wyczyszczono cache plików", interaction.user,
+                         f"zwolniono {freed / 1024 / 1024:.1f} MB")
+        await interaction.followup.send(
+            f"🧹 Cache wyczyszczony — zwolniono **{freed / 1024 / 1024:.1f} MB**.\n"
+            "Pliki zostaną pobrane ponownie przy najbliższej potrzebie.", ephemeral=True)
+        return
+
+    if akcja.value == "prefetch":
+        await interaction.followup.send("⏳ Pobieram zapas plików do cache (zajmie chwilę)...",
+                                       ephemeral=True)
+        result = await precache_items()
+        cache = FILE_CACHE.stats()
+        await interaction.followup.send(
+            f"✅ Pre-cache gotowy: **{result['ok']}** pobranych, **{result['failed']}** błędów, "
+            f"**{result['skipped']}** już było.\n"
+            f"Na dysku: **{cache['files']}** plików ({cache['bytes'] / 1024 / 1024:.1f} MB).",
+            ephemeral=True)
+        return
+
+    cache = FILE_CACHE.stats()
+    await interaction.followup.send(
+        f"🗃️ **Cache:** {'włączony' if cache['enabled'] else 'wyłączony'} (TTL {cache['ttl_hours']} h)\n"
+        f"Plików: **{cache['files']}** ({cache['bytes'] / 1024 / 1024:.1f} MB)\n"
+        f"Trafienia / pobrania z sieci: **{cache['hits']} / {cache['misses']}**",
+        ephemeral=True)
+
+
+@bot.tree.command(name="czysc", description="Ręczne sprzątanie dysku: ZIP-y, sesje, cache (admin)")
+@app_commands.default_permissions(administrator=True)
+async def cmd_clean(interaction: discord.Interaction) -> None:
+    """Uruchamia Garbage Collector na żądanie i pokazuje, ile miejsca zwolnił."""
+    await interaction.response.defer(ephemeral=True)
+    before = STORAGE.disk_usage()
+    report = STORAGE.sweep()
+    after = STORAGE.disk_usage()
+    freed = max(0, sum(before.values()) - sum(after.values()))
+    await system_log(interaction.guild, "Ręczne sprzątanie dysku", interaction.user,
+                     f"usunięto {report['removed']} paczek, zwolniono {freed / 1024 / 1024:.1f} MB")
+    await interaction.followup.send(
+        f"🧹 **Sprzątanie zakończone.**\n"
+        f"Usunięte paczki: **{report['removed']}**\n"
+        f"Zwolnione miejsce: **{freed / 1024 / 1024:.1f} MB** "
+        f"(w tym cache: {report['cache_freed_bytes'] / 1024 / 1024:.1f} MB)\n"
+        f"Dysk bota teraz: **{sum(after.values()) / 1024 / 1024:.1f} MB**", ephemeral=True)
 
 
 @bot.tree.command(name="build", description="Ustawia docelowy build GTA V dla nowych paczek")
