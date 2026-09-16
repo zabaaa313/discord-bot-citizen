@@ -357,8 +357,10 @@ core_log = log("Core")
 # 6. BEZPIECZEŃSTWO PLIKÓW (anti-malware)
 # ============================================================================
 
+# Surowych tekstur (.dds/.png/.jpg) nie blokujemy, ale wymagają zgody admina
+# i przechodzą przez walidator anty-crash (wymiary + szacowany VRAM).
 ALLOW_EXT = {".rpf", ".ytd", ".ydr", ".yft", ".ymt", ".dat", ".xml", ".meta", ".txt", ".json", ".ini", ".cfg"}
-REVIEW_EXT = {".asi", ".zip", ".rar", ".7z", ".oiv", ".cab"}
+REVIEW_EXT = {".asi", ".zip", ".rar", ".7z", ".oiv", ".cab", ".dds", ".png", ".jpg", ".jpeg"}
 BLOCK_EXT = {
     ".exe", ".bat", ".cmd", ".com", ".scr", ".pif", ".msi", ".msp", ".dll", ".sys",
     ".vbs", ".vbe", ".js", ".jse", ".wsf", ".wsh", ".ps1", ".psm1", ".jar", ".lnk",
@@ -984,6 +986,8 @@ class Session:
         self.search_query = ""                  # ostatnia fraza (paginacja wyników)
         self.search_page = 0                    # aktualna strona wyników
         self.searches_awarded: List[str] = []   # frazy, za które już dodano XP
+        self.validation_issues: List[Dict[str, Any]] = []   # raport walidatora anty-crash
+        self.fatal_skipped: List[str] = []                  # pliki odrzucone jako crash-prone
         self.build_id = DEFAULT_BUILD_ID
         self.preview_token: Optional[str] = None
         self.created_at = time.time()
@@ -1445,11 +1449,18 @@ async def award_xp(profile: Optional[Profile], event: str,
         return None
     message = profile.add_xp(event, amount)
     profiles_save()
-    if message and channel is not None:
-        try:
-            await channel.send(message)
-        except discord.HTTPException:
-            pass
+    if message:
+        if channel is not None:
+            try:
+                await channel.send(message)
+            except discord.HTTPException:
+                pass
+        # Most do FiveM: awans gracza prosto na czat w grze
+        await bridge_notify("🏅 Awans twórcy",
+                            f"{profile.username or profile.user_id} osiągnął rangę "
+                            f"{profile.rank['name']} (poziom {profile.level}, {profile.xp} XP)",
+                            kind="level", meta={"user_id": profile.user_id,
+                                                "level": profile.level})
     profile_log.info("XP %s (+%s) dla %s %s", event,
                      XP_EVENTS.get(event, amount), profile.user_id, reason)
     return message
@@ -1909,6 +1920,12 @@ async def download_file(http: aiohttp.ClientSession, url: str, dest: Path,
         if response.status != 200:
             raise ValueError(f"HTTP {response.status} przy {url}")
 
+        expected = 0
+        try:
+            expected = int(response.headers.get("Content-Length") or 0)
+        except ValueError:
+            expected = 0
+
         received = 0
         with open(dest, "wb") as fh:
             async for chunk in response.content.iter_chunked(64 * 1024):
@@ -1918,6 +1935,14 @@ async def download_file(http: aiohttp.ClientSession, url: str, dest: Path,
                     dest.unlink(missing_ok=True)
                     raise ValueError(f"Plik przekracza limit {MAX_DOWNLOAD_MB} MB")
                 fh.write(chunk)
+
+    # ANTY-CRASH: urwane pobranie to najczęstsza przyczyna crashu GTA V
+    if expected and received != expected:
+        dest.unlink(missing_ok=True)
+        raise ValueError(f"Niekompletne pobranie ({received} z {expected} bajtów) — spróbuj ponownie")
+    if received == 0:
+        dest.unlink(missing_ok=True)
+        raise ValueError("Pusty plik (0 bajtów) — odrzucono")
     return dest
 
 
@@ -1957,13 +1982,317 @@ async def fetch_to_cache(http: aiohttp.ClientSession, url: str) -> Path:
     return target
 
 
-async def process_items(workspace: Path, items: Sequence[Dict[str, str]]) -> List[Dict[str, Any]]:
+# ============================================================================
+# 15.5. WALIDATOR PLIKÓW GRY (anti-crash) + AUTO-PATCHER
+#    Sprawdza strukturę .rpf/.ytd/.ydr/.dds/.xml i naprawia to, co da się
+#    bezpiecznie naprawić (BOM, końce linii, deklaracja XML, mipmapy w DDS
+#    przez Pillow — jeśli jest zainstalowany).
+# ============================================================================
+
+validator_log = log("Validator")
+
+MAX_TEXTURE_DIMENSION = int(os.getenv("MAX_TEXTURE_DIMENSION", "4096") or 4096)
+MAX_TEXTURE_VRAM_MB = int(os.getenv("MAX_TEXTURE_VRAM_MB", "64") or 64)
+AUTO_PATCH_FILES = os.getenv("AUTO_PATCH_FILES", "1").strip().lower() not in ("0", "false", "no")
+
+RSC7_MAGIC = b"RSC7"
+RPF7_MAGIC = b"RPF7"
+DDS_MAGIC = b"DDS "
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+JPEG_MAGIC = b"\xff\xd8\xff"
+TGA_FOOTER = b"TRUEVISION-XFILE"
+
+# Formaty, które trzeba przepuścić przez walidację (reszta: tylko rozmiar)
+BINARY_TEXTURE_EXT = {".ytd", ".ydr", ".yft", ".ymt", ".rpf", ".dds"}
+TEXT_CONFIG_EXT = {".xml", ".meta", ".dat", ".ini", ".cfg", ".txt", ".json"}
+
+
+def _dds_info(data: bytes) -> Dict[str, Any]:
+    """Czyta nagłówek DDS: wymiary, mipmapy, format i szacowany VRAM."""
+    info: Dict[str, Any] = {"dds": True}
+    if len(data) < 128:
+        return {"dds": True, "broken": True}
+    flags = int.from_bytes(data[8:12], "little")
+    height = int.from_bytes(data[12:16], "little")
+    width = int.from_bytes(data[16:20], "little")
+    mipmaps = int.from_bytes(data[28:32], "little") or 1
+    fourcc = data[84:88]
+    info.update({"width": width, "height": height, "mipmaps": mipmaps,
+                 "format": fourcc.decode("ascii", "replace").strip() or "RAW",
+                 "header_flags": flags})
+    # VRAM: DXT/BC = 1 bajt na piksel, RAW = 4 bajty na piksel (szacunek)
+    per_pixel = 1.0 if fourcc[:1] in (b"D", b"A", b"B") else 4.0
+    base = width * height * per_pixel
+    info["vram_mb"] = round(base * (4 / 3 if mipmaps > 1 else 1) / 1024 / 1024, 2)
+    if width <= 0 or height <= 0 or width > 32768 or height > 32768:
+        info["broken"] = True
+    return info
+
+
+def _rpf_info(data: bytes) -> Dict[str, Any]:
     """
-    Buduje pliki we workspace: z lokalnego cache (natychmiast) albo z sieci.
-    Liczy SHA-256 każdego pliku (manifest + HASHES.txt w paczce).
+    Sprawdza nagłówek archiwum RPF7.
+
+    GTA V nie czyta zaszyfrowanych archiwów bez klucza, więc dla nich
+    ograniczamy się do walidacji nagłówka i spójności tabeli (najczęstszy
+    problem to urwany plik — i to wyłapujemy).
+    """
+    info: Dict[str, Any] = {"rpf": True}
+    if len(data) < 16:
+        return {"rpf": True, "broken": True, "reason": "nagłówek RPF7 ucięty"}
+    entry_count = int.from_bytes(data[4:8], "little")
+    names_length = int.from_bytes(data[8:12], "little")
+    encryption = int.from_bytes(data[12:16], "little")
+    info.update({"entries": entry_count, "names_length": names_length,
+                 "encryption": encryption})
+    toc_end = 16 + entry_count * 16
+    names_end = toc_end + names_length
+    if entry_count > 5_000_000 or names_length > 200_000_000:
+        return {**info, "broken": True, "reason": "nagłówek RPF7 wygląda na uszkodzony"}
+    if toc_end > len(data):
+        return {**info, "broken": True,
+                "reason": f"tabela plików (TOC) wychodzi poza archiwum — plik urwany?",
+                "toc_end": toc_end, "size": len(data)}
+    if names_end > len(data):
+        return {**info, "broken": True,
+                "reason": "tabela nazw wychodzi poza archiwum — plik urwany?",
+                "names_end": names_end, "size": len(data)}
+    if encryption:
+        info["encrypted"] = True
+        info["reason"] = ("archiwum zaszyfrowane (AES) — struktura nagłówka poprawna, "
+                          "pełna weryfikacja zawartości niemożliwa")
+    return info
+
+
+def _rsc7_info(data: bytes) -> Dict[str, Any]:
+    """Sprawdza nagłówek zasobu RSC7 (.ytd/.ydr/.yft/.ymt)."""
+    info: Dict[str, Any] = {"rsc7": True, "size": len(data)}
+    if len(data) < 16:
+        return {**info, "broken": True, "reason": "nagłówek RSC7 ucięty"}
+    version = int.from_bytes(data[4:8], "little")
+    system_flags = int.from_bytes(data[8:12], "little")
+    graphics_flags = int.from_bytes(data[12:16], "little")
+    info.update({"version": version, "system_flags": system_flags,
+                 "graphics_flags": graphics_flags})
+    if version not in (2, 3, 4, 5):
+        info["warning"] = f"nietypowa wersja zasobu RSC7 (v{version})"
+    if system_flags == 0 and graphics_flags == 0:
+        info["broken"] = True
+        info["reason"] = "nagłówek RSC7 bez flag zasobu (uszkodzony plik)"
+    return info
+
+
+def analyze_binary(path: Path) -> Dict[str, Any]:
+    """
+    Analizuje plik gry i zwraca raport pod kątem ryzyka crashu.
+
+    Zwraca dict: {severity: 'ok'|'warn'|'crash', reason, details, fixes}
+    severity 'crash' oznacza, że plik NIE może trafić do paczki (bot go pominie).
+    """
+    report: Dict[str, Any] = {"file": path.name, "severity": "ok", "reason": "",
+                              "details": {}, "fixes": [], "bytes": 0}
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        return {**report, "severity": "crash", "reason": f"nie mogę odczytać pliku ({exc})"}
+    report["bytes"] = size
+    if size == 0:
+        return {**report, "severity": "crash", "reason": "plik ma 0 bajtów"}
+
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(128)
+    except OSError as exc:
+        return {**report, "severity": "crash", "reason": f"błąd odczytu ({exc})"}
+
+    suffix = path.suffix.lower()
+
+    is_png = head.startswith(PNG_MAGIC)
+    is_jpeg = head.startswith(JPEG_MAGIC)
+    is_zip = head[:2] == b"PK"
+
+    # 1. Treść nie pasuje do rozszerzenia (częsta przyczyna crashu)
+    image_ext = {".png", ".jpg", ".jpeg"}
+    archive_ext = {".zip", ".rar", ".7z", ".oiv", ".cab"}
+    if (is_png or is_jpeg) and suffix not in image_ext:
+        kind = "obraz PNG" if is_png else "obraz JPEG"
+        return {**report, "severity": "crash",
+                "reason": f"zawartość to {kind}, a plik nazywa się `{path.name}` — "
+                          "gra nie odczyta takiego pliku (crash przy starcie).",
+                "details": {"detected": kind}}
+    if is_zip and suffix not in archive_ext:
+        return {**report, "severity": "crash",
+                "reason": f"zawartość to archiwum ZIP, a plik nazywa się `{path.name}` — "
+                          "gra nie odczyta takiego pliku (crash przy starcie).",
+                "details": {"detected": "archiwum ZIP"}}
+
+    # 1b. Prawdziwy obraz (np. surowa tekstura .png/.jpg) — sprawdź wymiary
+    if is_png:
+        with open(path, "rb") as handle:
+            header = handle.read(24)
+        width = int.from_bytes(header[16:20], "big") if len(header) >= 24 else 0
+        height = int.from_bytes(header[20:24], "big") if len(header) >= 24 else 0
+        report["details"].update({"image": "png", "width": width, "height": height})
+        if width <= 0 or height <= 0:
+            return {**report, "severity": "crash", "reason": "uszkodzony nagłówek PNG"}
+        if max(width, height) > MAX_TEXTURE_DIMENSION:
+            report["severity"] = ("crash" if max(width, height) > MAX_TEXTURE_DIMENSION * 2
+                                  else "warn")
+            report["reason"] = (f"obraz {width}x{height} przekracza zalecane "
+                                f"{MAX_TEXTURE_DIMENSION}px — ryzyko out-of-memory")
+        return report
+    if is_jpeg:
+        report["details"].update({"image": "jpeg", "bytes_mb": round(size / 1024 / 1024, 2)})
+        if size > 12 * 1024 * 1024:
+            report["severity"] = "warn"
+            report["reason"] = (f"obraz JPEG ma {size / 1024 / 1024:.1f} MB — "
+                                "duże tekstury podnoszą zużycie VRAM")
+        return report
+
+    # 2. Surowa tekstura DDS (np. wgrana zamiast .ytd)
+    if head.startswith(DDS_MAGIC):
+        with open(path, "rb") as handle:
+            data = handle.read(160)
+        info = _dds_info(data)
+        report["details"].update(info)
+        if info.get("broken"):
+            return {**report, "severity": "crash", "reason": "uszkodzony nagłówek DDS"}
+        if info["width"] > MAX_TEXTURE_DIMENSION or info["height"] > MAX_TEXTURE_DIMENSION:
+            severity = "crash" if max(info["width"], info["height"]) > MAX_TEXTURE_DIMENSION * 2 else "warn"
+            report["severity"] = severity
+            report["reason"] = (f"tekstura {info['width']}x{info['height']} — powyżej zalecanych "
+                                f"{MAX_TEXTURE_DIMENSION}px (ryzyko out-of-memory / crashu)")
+        if info.get("vram_mb", 0) > MAX_TEXTURE_VRAM_MB:
+            if report["severity"] != "crash":
+                report["severity"] = "warn"
+            report["reason"] = (report["reason"] or "") + \
+                f" VRAM ~{info['vram_mb']} MB (budżet {MAX_TEXTURE_VRAM_MB} MB)."
+        if info.get("mipmaps", 1) <= 1:
+            report["details"]["no_mipmaps"] = True
+            if report["severity"] == "ok":
+                report["severity"] = "warn"
+                report["reason"] = "brak mipmap — większe zużycie VRAM i migotanie tekstur"
+        return report
+
+    # 3. Zasób RSC7 (standardowy format .ytd/.ydr/.yft)
+    if head.startswith(RSC7_MAGIC):
+        info = _rsc7_info(head)
+        report["details"].update(info)
+        if info.get("broken"):
+            return {**report, "severity": "crash", "reason": info.get("reason", "uszkodzony RSC7")}
+        if info.get("warning"):
+            report["severity"] = "warn"
+            report["reason"] = info["warning"]
+        return report
+
+    # 4. Archiwum RPF7
+    if head.startswith(RPF7_MAGIC):
+        with open(path, "rb") as handle:
+            data = handle.read(64 * 1024)
+        info = _rpf_info(data)
+        report["details"].update(info)
+        if info.get("broken"):
+            return {**report, "severity": "crash", "reason": info.get("reason", "uszkodzony RPF7")}
+        if info.get("encrypted"):
+            report["severity"] = "warn"
+            report["reason"] = info["reason"]
+        return report
+
+    # 5. Rozszerzenia z rozszerzeniem .rpf/.ytd/.ydr, ale bez znanego nagłówka
+    if suffix in BINARY_TEXTURE_EXT:
+        if size < 1024:
+            return {**report, "severity": "crash",
+                    "reason": (f"plik ma tylko {size} B — to nie może być pełny zasób gry "
+                               "(prawdopodobnie urwane pobranie lub strona HTML zamiast pliku)")}
+        return {**report, "severity": "warn",
+                "reason": "nieznany nagłówek zasobu — zaimportowany przez inne narzędzie, "
+                          "zweryfikuj go w OpenIV/CodeWalkerze"}
+
+    # 6. Pliki konfiguracyjne (XML/DAT/INI) — tu naprawy są naprawdę bezpieczne
+    if suffix in TEXT_CONFIG_EXT:
+        try:
+            text = path.read_text(encoding="utf-8", errors="strict")
+        except UnicodeDecodeError:
+            return {**report, "severity": "ok", "details": {"binary_config": True},
+                    "reason": "plik binarny — pomijam analizę tekstową"}
+        except OSError as exc:
+            return {**report, "severity": "crash", "reason": f"błąd odczytu ({exc})"}
+        if suffix in (".xml", ".meta"):
+            try:
+                import xml.etree.ElementTree as element_tree
+                element_tree.fromstring(text.strip().encode("utf-8"))
+            except Exception as exc:  # noqa: BLE001
+                report["severity"] = "warn"
+                report["reason"] = f"XML nie jest poprawny ({type(exc).__name__}: {str(exc)[:80]})"
+        return report
+
+    return report
+
+
+def autopatch_file(path: Path, report: Dict[str, Any]) -> List[str]:
+    """
+    Bezpieczne, automatyczne naprawy (na miejscu):
+      • usunięcie BOM i normalizacja końców linii w XML/META/INI/CFG,
+      • dodanie deklaracji XML, jeśli jej brakuje,
+      • dociągnięcie mipmap / zmniejszenie zbyt dużej tekstury DDS lub obrazu
+        (tylko jeśli Pillow jest zainstalowany).
+    Zwraca listę wykonanych napraw.
+    """
+    fixes: List[str] = []
+    if not AUTO_PATCH_FILES:
+        return fixes
+    suffix = path.suffix.lower()
+    try:
+        if suffix in {".xml", ".meta", ".ini", ".cfg"}:
+            raw = path.read_bytes()
+            # utf-8-sig zdejmuje BOM z treści (sama flaga „changed" to za mało!)
+            text = raw.decode("utf-8-sig", errors="ignore")
+            changed = False
+            if raw.startswith(b"\xef\xbb\xbf"):
+                changed = True
+                fixes.append("usunięto BOM (GTA V potrafi się na nim wyłożyć)")
+            if "\r\n" in text:
+                text = text.replace("\r\n", "\n")
+                changed = True
+                fixes.append("zamieniono końce linii CRLF -> LF")
+            if suffix in {".xml", ".meta"} and not text.lstrip().startswith("<?xml"):
+                text = '<?xml version="1.0" encoding="UTF-8"?>\n' + text
+                changed = True
+                fixes.append("dodano deklarację XML")
+            if changed:
+                # Zapis przez bajty — Windows nie zamieni nam LF z powrotem na CRLF
+                path.write_bytes(text.encode("utf-8"))
+        elif suffix in {".dds", ".png", ".jpg", ".jpeg"}:
+            dimensions = report.get("details") or {}
+            too_big = (suffix == ".dds" and max(dimensions.get("width", 0), dimensions.get("height", 0)) > MAX_TEXTURE_DIMENSION) \
+                or (suffix in {".png", ".jpg", ".jpeg"} and dimensions.get("broken"))
+            if too_big:
+                try:
+                    from PIL import Image  # type: ignore
+                except Exception:
+                    return fixes
+                with Image.open(path) as image:
+                    if max(image.size) > MAX_TEXTURE_DIMENSION:
+                        ratio = MAX_TEXTURE_DIMENSION / max(image.size)
+                        new_size = (max(1, int(image.width * ratio)), max(1, int(image.height * ratio)))
+                        image.resize(new_size).save(path)
+                        fixes.append(f"zmniejszono teksturę do {new_size[0]}x{new_size[1]} (Pillow)")
+    except Exception as exc:  # noqa: BLE001
+        validator_log.warning("Auto-patch %s nieudany: %s", path.name, exc)
+    return fixes
+
+
+async def process_items(workspace: Path, items: Sequence[Dict[str, str]],
+                        session: Optional["Session"] = None) -> List[Dict[str, Any]]:
+    """
+    Buduje pliki we workspace: z lokalnego cache (natychmiast) albo z sieci,
+    a następnie przepuszcza każdy plik przez WALIDATOR ANTY-CRASH.
+
+    Pliki klasy 'crash' są pomijane (i raportowane graczowi oraz administracji),
+    żeby paczka nie wysypała gry. Liczone są SHA-256 wszystkich plików paczki.
     """
     hashes: List[Dict[str, Any]] = []
-    async with aiohttp.ClientSession(headers={"User-Agent": "FiveMModFoundry/2.0"}) as http:
+    async with aiohttp.ClientSession(headers={"User-Agent": "FiveMModFoundry/3.0"}) as http:
         for item in items:
             url = item["file_url"]
             file_name = resolve_file_name(item)
@@ -1976,12 +2305,61 @@ async def process_items(workspace: Path, items: Sequence[Dict[str, str]]) -> Lis
                 fp_log.info("Pobieram (raz, potem z cache): %s", url)
                 source = await fetch_to_cache(http, url)
             await asyncio.to_thread(shutil.copyfile, source, dest)
+
+            # --- ANTY-CRASH: walidacja + auto-patch ---
+            report = await asyncio.to_thread(analyze_binary, dest)
+            fixes = await asyncio.to_thread(autopatch_file, dest, report)
+            if fixes:
+                report["fixes"] = fixes
+                fp_log.info("  🔧 %s: %s", file_name, "; ".join(fixes))
+            if report["severity"] == "crash":
+                fp_log.error("  ⛔ %s odrzucony: %s", file_name, report["reason"])
+                dest.unlink(missing_ok=True)
+                if session is not None:
+                    session.validation_issues.append(report)
+                    session.fatal_skipped.append(item.get("name") or file_name)
+                continue
+            if session is not None and report["severity"] == "warn":
+                session.validation_issues.append(report)
+
             digest, size = sha256_file(dest)
             rel = dest.relative_to(workspace).as_posix()
             hashes.append({"path": rel, "sha256": digest, "size": size})
             fp_log.info("  ✓ %s (%.1f KB)", file_name, size / 1024)
             item["file_name"] = file_name
     return hashes
+
+
+def validation_report_text(title: str, issues: Sequence[Dict[str, Any]],
+                           skipped: Sequence[str], file_count: int) -> str:
+    """Raport walidacji dołączany do paczki (VALIDACJA-PACZKI.txt)."""
+    lines = [
+        "=" * 62,
+        f"  WALIDACJA PACZKI — {title}",
+        "=" * 62,
+        f"  Sprawdzonych plików: {file_count}",
+        f"  Ostrzeżenia: {sum(1 for i in issues if i.get('severity') == 'warn')}",
+        f"  Odrzucone (ryzyko crashu): {len(skipped)}",
+        "",
+    ]
+    if skipped:
+        lines += ["ODRZUCONE PLIKI (nie weszły do paczki):"]
+        lines += [f"  ⛔ {name}" for name in skipped]
+        lines += ["", "Dlaczego: bot wykrył w nich struktury, które najczęściej "
+                      "wysypują GTA V (urwany zasób, zła nazwa formatu, zbyt duża tekstura)."]
+    if issues:
+        lines += ["", "OSTRZEŻENIA (plik w paczce, ale warto wiedzieć):"]
+        for issue in issues:
+            icon = "⛔" if issue.get("severity") == "crash" else "⚠️"
+            lines.append(f"  {icon} {issue.get('file')}: {issue.get('reason')}")
+            for fix in issue.get("fixes") or []:
+                lines.append(f"      🔧 auto-naprawa: {fix}")
+    if not issues and not skipped:
+        lines.append("  ✅ Wszystkie pliki przeszły walidację bez uwag.")
+    lines += ["", "Walidator sprawdza: nagłówki RSC7 (.ytd/.ydr), tabelę archiwum RPF7,",
+              "wymiary i VRAM tekstur DDS, poprawność XML/META oraz zgodność treści",
+              "z rozszerzeniem pliku. Auto-naprawy są zapisywane powyżej przy pliku."]
+    return "\n".join(lines)
 
 
 def all_configured_items() -> List[Dict[str, str]]:
@@ -2169,7 +2547,19 @@ async def deliver_package(interaction: discord.Interaction, session: Session,
         build_dir = session.workspace / f"build-{kind}-{int(time.time() * 1000)}"
         build_dir.mkdir(parents=True, exist_ok=True)
         try:
-            hashes = await process_items(build_dir, items)
+            hashes = await process_items(build_dir, items, session)
+
+            # ANTY-CRASH: raport walidacji plików gry trafia do paczki
+            validation_path = build_dir / "VALIDACJA-PACZKI.txt"
+            validation_path.write_text(
+                validation_report_text(
+                    "PACZKA CITIZEN" if kind == "citizen" else "PACZKA SKINÓW BRONI",
+                    session.validation_issues, session.fatal_skipped, len(hashes)),
+                encoding="utf-8")
+            validation_digest, validation_size = sha256_file(validation_path)
+            hashes.append({"path": "VALIDACJA-PACZKI.txt", "sha256": validation_digest,
+                           "size": validation_size})
+
             # Personalizacja: unikalny token + podpis + metadane twórcy w paczce
             token_record = None
             if profile is not None:
@@ -2191,7 +2581,9 @@ async def deliver_package(interaction: discord.Interaction, session: Session,
             size = await asyncio.to_thread(zip_directory, build_dir, zip_path)
             file_count = count_files(build_dir)
             return {"zip_path": zip_path, "size": size, "file_count": file_count,
-                    "pack_token": (token_record or {}).get("token")}
+                    "pack_token": (token_record or {}).get("token"),
+                    "skipped": list(session.fatal_skipped),
+                    "warnings": [i for i in session.validation_issues if i.get("severity") == "warn"]}
         finally:
             await asyncio.to_thread(safe_rmtree, build_dir, session.workspace)
 
@@ -2260,6 +2652,24 @@ async def deliver_package(interaction: discord.Interaction, session: Session,
     ]
     if conflicts:
         lines += ["", f"⚠️ Auto-rozwiązano **{len(conflicts)}** konflikt(ów) plików."]
+
+    # ANTY-CRASH: informacja o walidacji + auto-naprawach
+    skipped = result.get("skipped") or []
+    warnings = result.get("warnings") or []
+    fixes = [fix for issue in session.validation_issues for fix in (issue.get("fixes") or [])]
+    if skipped:
+        lines += ["", f"⛔ **Odrzucono {len(skipped)} plików** (ryzyko crashu gry): "
+                      f"{', '.join(skipped[:3])}{'…' if len(skipped) > 3 else ''}",
+                  "Szczegóły w `VALIDACJA-PACZKI.txt` — wybierz inny wariant moda."]
+    if warnings:
+        lines += ["", f"🩺 Walidator zgłosił **{len(warnings)}** ostrzeżeń "
+                      "(szczegóły w `VALIDACJA-PACZKI.txt`)."]
+    if fixes:
+        lines += ["", f"🔧 **Auto-naprawy wykonane przez bota:** {len(fixes)}",
+                  "• " + "\n• ".join(fixes[:4])]
+    if not skipped and not warnings and not fixes:
+        lines += ["", "🩺 Walidacja anty-crash: **wszystkie pliki OK** ✅"]
+
     if session.preview_token:
         lines += ["", f"🖼️ [Podgląd kombinacji]({PUBLIC_URL}/preview/{session.preview_token})"]
     if result.get("pack_token"):
@@ -2308,6 +2718,24 @@ async def deliver_package(interaction: discord.Interaction, session: Session,
         await award_xp(profile, "option", interaction.channel,
                        amount=XP_EVENTS["option"] * len(items), reason="wybrane opcje")
         await award_xp(profile, "session", interaction.channel, reason="zakończona sesja")
+
+    # ANTY-CRASH: odrzucone pliki trafiają do administracji (może podmienić źródło)
+    if result.get("skipped"):
+        await notify_error(
+            "Walidator odrzucił pliki w paczce",
+            (f"Gracz: <@{session.user_id}> • typ: {kind}\n"
+             f"Odrzucone: {', '.join(str(s) for s in result['skipped'][:5])}\n"
+             "Powód: struktura pliku wskazywała na ryzyko crashu GTA V."),
+            None, "validator")
+
+    # Most do FiveM: informacja o nowej paczce (in-game / kolejka dla resource'a)
+    await bridge_notify(
+        "📦 Nowa paczka Foundry",
+        (f"{profile.username if profile else session.user_id} wygenerował paczkę "
+         f"*{kind}* — {result['file_count']} plików, {result['size'] / 1024 / 1024:.1f} MB"
+         + (f" • token `{result['pack_token']}`" if result.get("pack_token") else "")),
+        kind="pack",
+        meta={"user_id": session.user_id, "token": result.get("pack_token"), "kind": kind})
 
     # Publikacja na kanale #centrum-pobierania
     guild = interaction.guild
@@ -2433,6 +2861,7 @@ async def scan_videos() -> List[Dict[str, Any]]:
 async def post_videos(bot: "FoundryBot", videos: Sequence[Dict[str, Any]]) -> int:
     """Wrzuca filmy na kanał #mody-optymalizacja-live każdego serwera."""
     posted = 0
+    posted_titles: List[str] = []
     for guild in bot.guilds:
         channel = find_channel(guild, CAT_MODS, CH_MODS_LIVE)
         if not channel:
@@ -2458,8 +2887,15 @@ async def post_videos(bot: "FoundryBot", videos: Sequence[Dict[str, Any]]) -> in
             try:
                 await channel.send(embed=embed)
                 posted += 1
+                posted_titles.append(str(video.get("title"))[:80])
             except discord.HTTPException as exc:
                 yt_log.warning("Nie wyslano na %s: %s", guild.name, exc)
+    if posted:
+        await bridge_notify(
+            "🎬 Nowe mody w feedzie",
+            f"Wrzucono {posted} nowych filmów z modami klienckimi: "
+            + "; ".join(posted_titles[:3]),
+            kind="mods", meta={"count": posted})
     return posted
 
 
@@ -3373,27 +3809,267 @@ async def reset_server(guild: discord.Guild, executor: discord.abc.User) -> List
     return results
 
 
+# ============================================================================
+# 21.5. GHOST COPY — klonowanie struktury serwera (jeden klik)
+#    Eksport całej struktury (role + uprawnienia, kategorie, kanały, nadpisania)
+#    do szablonu JSON i odtworzenie jej na dowolnym serwerze.
+# ============================================================================
+
+ghost_log = log("GhostCopy")
+TEMPLATES_DIR = DATA_DIR / "templates"
+TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+COPY_CONFIRM_WORD = "KOPIUJ"
+
+
+def _overwrites_to_json(overwrites: Any) -> Dict[str, Dict[str, int]]:
+    """Zapisuje nadpisania uprawnień kluczem = nazwa roli (ID się nie przenoszą)."""
+    out: Dict[str, Dict[str, int]] = {}
+    for target, overwrite in (overwrites or {}).items():
+        is_default = bool(getattr(target, "is_default", lambda: False)())
+        key = "@everyone" if is_default else f"@{getattr(target, 'name', '?')}"
+        try:
+            allow, deny = overwrite.pair()
+        except Exception:  # noqa: BLE001
+            continue
+        out[key] = {"allow": int(allow.value), "deny": int(deny.value)}
+    return out
+
+
+def export_guild_layout(guild: discord.Guild) -> Dict[str, Any]:
+    """
+    Zrzut struktury serwera do JSON: role (z uprawnieniami i kolorem),
+    kategorie, kanały (temat, nsfw, slowmode) i nadpisania uprawnień.
+    """
+    layout: Dict[str, Any] = {
+        "source": {"id": guild.id, "name": guild.name,
+                   "exported_at": datetime.now(timezone.utc).isoformat()},
+        "roles": [], "categories": [], "channels": [],
+    }
+    for role in sorted(guild.roles, key=lambda r: r.position):
+        if role.is_default() or role.managed:
+            continue
+        layout["roles"].append({
+            "name": role.name, "color": role.color.value, "hoist": role.hoist,
+            "mentionable": role.mentionable, "position": role.position,
+            "permissions": role.permissions.value,
+        })
+    for category in guild.categories:
+        layout["categories"].append({
+            "name": category.name, "position": category.position,
+            "overwrites": _overwrites_to_json(category.overwrites),
+        })
+    for channel in guild.channels:
+        if isinstance(channel, discord.CategoryChannel):
+            continue
+        entry: Dict[str, Any] = {
+            "name": channel.name,
+            "type": "voice" if isinstance(channel, discord.VoiceChannel) else "text",
+            "category": channel.category.name if channel.category else None,
+            "position": channel.position,
+            "overwrites": _overwrites_to_json(channel.overwrites),
+        }
+        if isinstance(channel, discord.TextChannel):
+            entry.update({"topic": channel.topic, "nsfw": channel.nsfw,
+                          "slowmode": channel.slowmode_delay})
+        layout["channels"].append(entry)
+    return layout
+
+
+def template_path(name: str) -> Path:
+    """Bezpieczna ścieżka szablonu (bez wychodzenia z katalogu)."""
+    safe = re.sub(r"[^a-z0-9_-]", "-", (name or "").strip().lower())[:40] or "szablon"
+    return TEMPLATES_DIR / f"{safe}.json"
+
+
+def template_save(name: str, layout: Dict[str, Any]) -> Path:
+    """Zapisuje szablon struktury serwera."""
+    path = template_path(name)
+    path.write_text(json.dumps(layout, ensure_ascii=False, indent=1), encoding="utf-8")
+    ghost_log.info("Zapisano szablon %s (%s rol, %s kanalow)", path.name,
+                   len(layout.get("roles") or []), len(layout.get("channels") or []))
+    return path
+
+
+def template_list() -> List[str]:
+    """Nazwy zapisanych szablonów."""
+    return sorted(path.stem for path in TEMPLATES_DIR.glob("*.json"))
+
+
+def template_load(name: str) -> Optional[Dict[str, Any]]:
+    """Wczytuje szablon (None, gdy brak lub uszkodzony)."""
+    path = template_path(name)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError) as exc:
+        ghost_log.warning("Nie wczytano szablonu %s: %s", name, exc)
+        return None
+
+
+def _permissions_from_json(overwrites: Any,
+                           role_map: Dict[str, discord.Role]) -> Dict[Any, discord.PermissionOverwrite]:
+    """Buduje nadpisania uprawnień dla nowego serwera (mapowanie po nazwach ról)."""
+    mapping: Dict[Any, discord.PermissionOverwrite] = {}
+    for key, data in (overwrites or {}).items():
+        target = role_map.get(key)
+        if target is None:
+            continue
+        try:
+            allow = discord.Permissions(int((data or {}).get("allow", 0)))
+            deny = discord.Permissions(int((data or {}).get("deny", 0)))
+            mapping[target] = discord.PermissionOverwrite.from_pair(allow, deny)
+        except Exception:  # noqa: BLE001
+            continue
+    return mapping
+
+
+async def apply_guild_layout(guild: discord.Guild, layout: Dict[str, Any], *,
+                             create_roles: bool = True,
+                             reason: str = "Ghost Copy") -> Dict[str, Any]:
+    """
+    Odtwarza strukturę z szablonu: role -> kategorie -> kanały (z nadpisaniami).
+    Nic nie usuwa — istniejące elementy są pomijane, brakujące tworzone.
+    """
+    report: Dict[str, Any] = {"roles": [], "categories": [], "channels": [], "errors": []}
+    role_map: Dict[str, discord.Role] = {"@everyone": guild.default_role}
+
+    if create_roles:
+        for entry in sorted(layout.get("roles") or [], key=lambda r: r.get("position", 0)):
+            name = str(entry.get("name") or "").strip()
+            if not name:
+                continue
+            existing = discord.utils.get(guild.roles, name=name)
+            if existing:
+                role_map[f"@{name}"] = existing
+                continue
+            try:
+                role = await guild.create_role(
+                    name=name, colour=discord.Colour(int(entry.get("color", 0))),
+                    hoist=bool(entry.get("hoist")), mentionable=bool(entry.get("mentionable")),
+                    permissions=discord.Permissions(int(entry.get("permissions", 0))), reason=reason)
+                role_map[f"@{name}"] = role
+                report["roles"].append(name)
+            except discord.HTTPException as exc:
+                report["errors"].append(f"rola {name}: {exc}")
+    else:
+        for role in guild.roles:
+            role_map[f"@{role.name}"] = role
+
+    category_map: Dict[str, discord.CategoryChannel] = {}
+    for entry in sorted(layout.get("categories") or [], key=lambda c: c.get("position", 0)):
+        name = str(entry.get("name") or "").strip()
+        if not name:
+            continue
+        existing_category = discord.utils.get(guild.categories, name=name)
+        if existing_category:
+            category_map[name] = existing_category
+            continue
+        try:
+            category = await guild.create_category(
+                name=name, overwrites=_permissions_from_json(entry.get("overwrites"), role_map),
+                reason=reason)
+            category_map[name] = category
+            report["categories"].append(name)
+        except discord.HTTPException as exc:
+            report["errors"].append(f"kategoria {name}: {exc}")
+
+    existing_names = {(channel.name, channel.category.name if channel.category else None)
+                      for channel in guild.channels}
+    for entry in layout.get("channels") or []:
+        name = str(entry.get("name") or "").strip()
+        category_name = entry.get("category")
+        if not name or (name, category_name) in existing_names:
+            continue
+        try:
+            overwrites = _permissions_from_json(entry.get("overwrites"), role_map)
+            category = category_map.get(category_name or "") if category_name else None
+            if entry.get("type") == "voice":
+                await guild.create_voice_channel(name=name, category=category,
+                                                 overwrites=overwrites, reason=reason)
+            else:
+                await guild.create_text_channel(
+                    name=name, category=category, overwrites=overwrites,
+                    topic=(entry.get("topic") or None),
+                    nsfw=bool(entry.get("nsfw")),
+                    slowmode_delay=int(entry.get("slowmode") or 0), reason=reason)
+            report["channels"].append(name)
+        except discord.HTTPException as exc:
+            report["errors"].append(f"kanał {name}: {exc}")
+
+    ghost_log.info("Ghost Copy: %s rol, %s kategorii, %s kanałow, %s błędów",
+                   len(report["roles"]), len(report["categories"]),
+                   len(report["channels"]), len(report["errors"]))
+    return report
+
+
+async def clone_guild_structure(source: discord.Guild, target: discord.Guild,
+                                executor: discord.abc.User,
+                                save_as: str = "") -> Dict[str, Any]:
+    """Kopiuje strukturę jednego serwera na drugi (z opcjonalnym zapisem szablonu)."""
+    layout = export_guild_layout(source)
+    if save_as:
+        template_save(save_as, layout)
+    report = await apply_guild_layout(target, layout, reason=f"Ghost Copy od {executor}")
+    report["source"] = f"{source.name} ({source.id})"
+    return report
+
+
+def ghost_report_embed(title: str, report: Dict[str, Any]) -> discord.Embed:
+    """Embed z wynikiem operacji Ghost Copy."""
+    embed = discord.Embed(title=title, color=C_GREEN, timestamp=datetime.now(timezone.utc),
+                          description=(f"**Źródło:** {report.get('source', 'szablon')}\n\n"
+                                       f"👥 Role utworzone: **{len(report.get('roles') or [])}**\n"
+                                       f"🗂️ Kategorie: **{len(report.get('categories') or [])}**\n"
+                                       f"💬 Kanały: **{len(report.get('channels') or [])}**\n"
+                                       f"⚠️ Błędy: **{len(report.get('errors') or [])}**"))
+    created = ((report.get("roles") or []) + (report.get("categories") or [])
+               + (report.get("channels") or []))
+    if created:
+        embed.add_field(name="Utworzone elementy", inline=False,
+                        value="```\n" + "\n".join(created[:20]) +
+                              (f"\n... i {len(created) - 20} więcej" if len(created) > 20 else "") + "\n```")
+    if report.get("errors"):
+        embed.add_field(name="Błędy (sprawdź uprawnienia bota)", inline=False,
+                        value="```\n" + "\n".join(str(e) for e in report["errors"][:8]) + "\n```")
+    return embed
+
+
 def system_panel_embed(guild: discord.Guild, executor: discord.abc.User) -> discord.Embed:
     """Embed panelu /system."""
+    templates = template_list()
     return discord.Embed(
         title="⚙️ Panel Systemowy — Zarządzanie serwerem",
         description=(f"**Serwer:** {guild.name}\n"
                      f"**Operator:** {executor.mention}\n\n"
                      "**Dostępne akcje:**\n"
                      "🎨 **Zbuduj design** — estetyczna przebudowa układu (emotki, kategorie, uprawnienia).\n"
+                     "👻 **Ghost Copy** — zapisz/sklonuj całą strukturę (role, kanały, uprawnienia).\n"
                      "⚠️ **Reset serwera** — usuwa strukturę bota (podwójne potwierdzenie!).\n\n"
-                     "**Zabezpieczenia:** tylko właściciel serwera lub Administrator.\n"
+                     f"📁 **Szablony Ghost Copy:** {len(templates)} "
+                     + (f"({', '.join(templates[:5])})" if templates else "*(brak — zapisz pierwszy przyciskiem 💾)*")
+                     + "\n\n**Zabezpieczenia:** tylko właściciel serwera lub Administrator.\n"
                      f"Każde użycie logowane do `#{CH_SYSLOG}`."),
         color=C_PURPLE, timestamp=datetime.now(timezone.utc))
 
 
-def system_panel_view() -> discord.ui.View:
-    """Przyciski panelu /system."""
-    return LayoutView([
-        btn("sys_build_design", "Zbuduj estetyczny design", discord.ButtonStyle.success, "🎨"),
-        btn("sys_reset_start", "Wyczyść / Resetuj serwer", discord.ButtonStyle.danger, "⚠️"),
-        btn("sys_refresh", "Odśwież panel", discord.ButtonStyle.secondary, "🔄"),
-    ])
+def system_panel_view(templates: Optional[Sequence[str]] = None) -> discord.ui.View:
+    """Przyciski panelu /system (+ szablony Ghost Copy)."""
+    rows: List[Any] = [
+        [btn("sys_build_design", "Zbuduj estetyczny design", discord.ButtonStyle.success, "🎨"),
+         btn("sys_reset_start", "Wyczyść / Resetuj serwer", discord.ButtonStyle.danger, "⚠️"),
+         btn("sys_refresh", "Odśwież panel", discord.ButtonStyle.secondary, "🔄")],
+        [btn("sys_template_save", "Zapisz szablon", discord.ButtonStyle.secondary, "💾"),
+         btn("sys_clone_from", "Sklonuj z innego serwera", discord.ButtonStyle.primary, "👻")],
+    ]
+    names = list(templates if templates is not None else template_list())[:24]
+    if names:
+        rows.append([select("sys_template_pick", "👻 Ghost Copy — zastosuj szablon...",
+                            [opt(f"Zastosuj: {name}", f"tpl:{name}",
+                                 "Odtworzy role, kategorie i kanały z szablonu")
+                             for name in names])])
+    return LayoutView(*rows)
 
 
 def parse_modal_value(interaction: discord.Interaction, field_id: str) -> str:
@@ -3573,6 +4249,61 @@ async def http_api_profile(request: web.Request) -> web.Response:
     return web.json_response(payload)
 
 
+async def http_api_bridge_inbox(request: web.Request) -> web.Response:
+    """
+    GET /api/bridge/inbox?after=<id> — kolejka zdarzeń dla resource'a FiveM.
+
+    Przykład w Lua (fxmanifest: `dependency 'foundry_bridge'`):
+      PerformHttpRequest(API .. "/api/bridge/inbox?after=" .. lastId, function(code, body)
+        for _, event in ipairs(json.decode(body)) do
+          TriggerClientEvent('chat:addMessage', -1, { args = { event.title, event.message } })
+          lastId = event.id
+        end
+      end, "GET", "")
+    """
+    try:
+        after = int(request.query.get("after", "0") or 0)
+    except ValueError:
+        after = 0
+    try:
+        limit = min(100, max(1, int(request.query.get("limit", "50") or 50)))
+    except ValueError:
+        limit = 50
+    return web.json_response({"ok": True, "events": bridge_pending(after, limit),
+                              "next_after": BRIDGE_INBOX[-1]["id"] if BRIDGE_INBOX else after})
+
+
+async def http_api_bridge_send(request: web.Request) -> web.Response:
+    """POST /api/bridge/send — wiadomość z gry na Discord (wymaga tokenu mostu)."""
+    if FIVEM_BRIDGE_TOKEN and request.headers.get("X-Foundry-Token") != FIVEM_BRIDGE_TOKEN:
+        return web.json_response({"ok": False, "error": "zły token mostu"}, status=403)
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        return web.json_response({"ok": False, "error": "oczekuję JSON"}, status=400)
+    author = str(payload.get("author", ""))[:64]
+    message = str(payload.get("message", ""))[:1500]
+    if not message:
+        return web.json_response({"ok": False, "error": "brak treści"}, status=400)
+    delivered = await bridge_relay_to_discord(bot, author, message,
+                                              str(payload.get("source", "gra"))[:32])
+    return web.json_response({"ok": delivered,
+                              "error": None if delivered else "brak kanału na Discordzie"},
+                             status=200 if delivered else 503)
+
+
+async def http_api_bridge_status(request: web.Request) -> web.Response:
+    """GET /api/bridge/status — stan mostu (push/pull)."""
+    return web.json_response({
+        "ok": True,
+        "push_url": bool(FIVEM_BRIDGE_URL),
+        "token_set": bool(FIVEM_BRIDGE_TOKEN),
+        "channel": BRIDGE_CHANNEL_NAME,
+        "queued": len(BRIDGE_INBOX),
+        "last_id": BRIDGE_INBOX[-1]["id"] if BRIDGE_INBOX else 0,
+    })
+
+
 async def http_api_stats(request: web.Request) -> web.Response:
     """GET /api/stats — statystyki bota (bez danych wrażliwych)."""
     queue = ZIP_QUEUE.info()
@@ -3598,6 +4329,9 @@ def create_http_app() -> web.Application:
     app.router.add_get("/preview/{token}", http_preview)
     app.router.add_get("/api/pack/{token}", http_api_pack)
     app.router.add_get("/api/profile/{user_id}", http_api_profile)
+    app.router.add_get("/api/bridge/inbox", http_api_bridge_inbox)
+    app.router.add_get("/api/bridge/status", http_api_bridge_status)
+    app.router.add_post("/api/bridge/send", http_api_bridge_send)
     app.router.add_get("/api/stats", http_api_stats)
     app.router.add_get("/", http_root)
     return app
@@ -3708,6 +4442,90 @@ def handle_loop_exception(loop: asyncio.AbstractEventLoop, context: Dict[str, An
     except RuntimeError:
         pass
 
+# ============================================================================
+# 22.6. MOST DISCORD <-> FIVEM (dwukierunkowa komunikacja z grą)
+#    Kierunek 1 (bot -> gra): kolejka do odpytania przez resource (pull)
+#                             + opcjonalny POST na FIVEM_BRIDGE_URL (push).
+#    Kierunek 2 (gra -> bot): POST /api/bridge/send -> kanał na Discordzie.
+# ============================================================================
+
+bridge_log = log("Bridge")
+
+FIVEM_BRIDGE_URL = os.getenv("FIVEM_BRIDGE_URL", "").strip()
+FIVEM_BRIDGE_TOKEN = os.getenv("FIVEM_BRIDGE_TOKEN", "").strip()
+BRIDGE_CHANNEL_NAME = os.getenv("BRIDGE_CHANNEL", "most-foundry").strip() or "most-foundry"
+BRIDGE_INBOX_LIMIT = int(os.getenv("BRIDGE_INBOX_LIMIT", "100") or 100)
+
+BRIDGE_INBOX: List[Dict[str, Any]] = []
+_bridge_seq = {"value": 0}
+
+
+def bridge_record(title: str, message: str, kind: str = "info",
+                  meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Dodaje zdarzenie do kolejki mostu (do odbioru przez serwer FiveM)."""
+    _bridge_seq["value"] += 1
+    record = {"id": _bridge_seq["value"], "at": int(time.time()), "title": title,
+              "message": message, "kind": kind, "meta": dict(meta or {})}
+    BRIDGE_INBOX.append(record)
+    del BRIDGE_INBOX[:-BRIDGE_INBOX_LIMIT]
+    return record
+
+
+async def bridge_notify(title: str, message: str, kind: str = "info",
+                        meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Wysyła zdarzenie bota do serwera FiveM.
+
+    • Zawsze ląduje w kolejce (tryb PULL): resource odpytuje
+      `GET /api/bridge/inbox?after=<id>` — działa nawet za NAT-em.
+    • Jeśli ustawisz FIVEM_BRIDGE_URL, bot dodatkowo wysyła POST (tryb PUSH)
+      z nagłówkiem `X-Foundry-Token`, więc resource dostaje zdarzenie od razu.
+    """
+    record = bridge_record(title, message, kind, meta)
+    bridge_log.info("[%s] %s | %s", kind, title, message)
+    if FIVEM_BRIDGE_URL:
+        headers = {"Content-Type": "application/json"}
+        if FIVEM_BRIDGE_TOKEN:
+            headers["X-Foundry-Token"] = FIVEM_BRIDGE_TOKEN
+        try:
+            async with aiohttp.ClientSession() as http:
+                await http.post(FIVEM_BRIDGE_URL, json=record, headers=headers,
+                                timeout=aiohttp.ClientTimeout(total=8))
+        except Exception as exc:  # noqa: BLE001
+            bridge_log.warning("Push do FiveM nieudany (%s) — zdarzenie czeka w kolejce.", exc)
+    return record
+
+
+def bridge_pending(after_id: int = 0, limit: int = 50) -> List[Dict[str, Any]]:
+    """Zdarzenia nowsze niż `after_id` (dla resource'a w grze)."""
+    try:
+        threshold = int(after_id)
+    except (TypeError, ValueError):
+        threshold = 0
+    return [record for record in BRIDGE_INBOX if record["id"] > threshold][:max(1, limit)]
+
+
+async def bridge_relay_to_discord(bot_instance: "FoundryBot", author: str, message: str,
+                                  source: str = "gra") -> bool:
+    """Drugi kierunek mostu: wiadomość z serwera FiveM trafia na Discord."""
+    for guild in bot_instance.guilds:
+        channel = (discord.utils.get(guild.text_channels, name=BRIDGE_CHANNEL_NAME)
+                   or find_channel(guild, CAT_MODS, CH_MODS_LIVE))
+        if channel is None:
+            continue
+        embed = discord.Embed(
+            title="🎮 Wiadomość z serwera FiveM",
+            description=(message or "")[:2000] or "—",
+            color=C_BLUE, timestamp=datetime.now(timezone.utc))
+        embed.set_footer(text=f"Źródło: {source} • {author or 'nieznany'}")
+        try:
+            await channel.send(embed=embed)
+            bridge_log.info("Przekazano wiadomosc z gry na #%s", channel.name)
+            return True
+        except discord.HTTPException as exc:
+            bridge_log.warning("Nie przekazano wiadomosci z gry: %s", exc)
+    return False
+
 
 class FoundryBot(discord.Client):
     """Klient Discorda z wbudowanym serwerem HTTP i zadaniami w tle."""
@@ -3780,6 +4598,9 @@ class FoundryBot(discord.Client):
              f"• Broni w bazie: **{len(all_weapons())}**\n"
              f"Kolejka ZIP: **{ZIP_QUEUE.concurrency_limit}** równolegle • "
              f"Cache plików: **{cache['files']}** ({cache['bytes'] / 1024 / 1024:.1f} MB)\n"
+             f"Most FiveM: **{'push+pull' if FIVEM_BRIDGE_URL else 'pull'}** "
+             f"(`/api/bridge/inbox`) • walidator anty-crash: "
+             f"**{'włączony' if AUTO_PATCH_FILES else 'tylko raport'}**\n"
              f"Paczki: **{STORAGE.stats()['packages']}** • Podglądy: **{STORAGE.stats()['previews']}**"),
             C_GREEN)
 
@@ -3840,8 +4661,16 @@ class FoundryBot(discord.Client):
                 return  # komendy slash obsługuje drzewo komend
 
             if interaction_type == discord.InteractionType.modal_submit:
-                if (interaction.data or {}).get("custom_id") == "sys_reset_modal":
+                modal_id = str((interaction.data or {}).get("custom_id", ""))
+                if modal_id == "sys_reset_modal":
                     await handle_reset_modal(interaction)
+                elif modal_id == "sys_save_modal":
+                    await handle_ghost_save_modal(interaction)
+                elif modal_id == "sys_clone_modal":
+                    await handle_ghost_clone_modal(interaction)
+                elif modal_id.startswith("sys_apply_modal:"):
+                    await handle_ghost_apply_modal(interaction,
+                                                   modal_id.split(":", 1)[1])
                 return
 
             if interaction_type != discord.InteractionType.component:
@@ -3868,7 +4697,7 @@ class FoundryBot(discord.Client):
                 await create_ticket(interaction, "weapons")
                 return
             if custom_id.startswith("sys_"):
-                await handle_system_button(interaction, custom_id)
+                await handle_system_button(interaction, custom_id, values)
                 return
             if custom_id.startswith(("sec_approve:", "sec_reject:")):
                 await handle_approval_button(interaction, custom_id)
@@ -4315,7 +5144,125 @@ async def handle_build_pick(interaction: discord.Interaction, session: Session,
     await interaction.response.send_message(f"✅ Docelowy build: **{build['name']}**", ephemeral=True)
 
 
-async def handle_system_button(interaction: discord.Interaction, custom_id: str) -> None:
+def ghost_save_modal() -> discord.ui.Modal:
+    """Modal zapisu obecnej struktury serwera jako szablonu."""
+    modal = discord.ui.Modal(title="💾 Zapisz szablon serwera (Ghost Copy)",
+                             custom_id="sys_save_modal")
+    modal.add_item(discord.ui.TextInput(
+        custom_id="sys_save_name", label="Nazwa szablonu", max_length=40,
+        placeholder="np. fivem-community", required=True))
+    return modal
+
+
+async def handle_ghost_save_modal(interaction: discord.Interaction) -> None:
+    """Zapisuje strukturę serwera do szablonu (Ghost Copy)."""
+    if not is_authorized(interaction):
+        await interaction.response.send_message("⛔ Brak uprawnień.", ephemeral=True)
+        return
+    name = parse_modal_value(interaction, "sys_save_name").strip()
+    if not name:
+        await interaction.response.send_message("❌ Podaj nazwę szablonu.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    layout = export_guild_layout(interaction.guild)
+    path = template_save(name, layout)
+    await system_log(interaction.guild, "Ghost Copy — zapis szablonu", interaction.user,
+                     f"{path.name}: {len(layout['roles'])} rol, {len(layout['categories'])} kategorii, "
+                     f"{len(layout['channels'])} kanałów")
+    await interaction.followup.send(
+        f"💾 **Szablon zapisany:** `{path.stem}`\n"
+        f"👥 Role: **{len(layout['roles'])}** • 🗂️ Kategorie: **{len(layout['categories'])}** "
+        f"• 💬 Kanały: **{len(layout['channels'])}**\n\n"
+        "Zastosuj go na innym serwerze przez `/ghost` → wybór z listy lub "
+        f"`/ghost akcja:klonuj serwer:<ID>`.", ephemeral=True)
+
+
+def ghost_apply_modal(name: str, roles: int, channels: int) -> discord.ui.Modal:
+    """Modal potwierdzenia zastosowania szablonu."""
+    modal = discord.ui.Modal(title=f"👻 Zastosuj szablon: {name[:40]}",
+                             custom_id=f"sys_apply_modal:{name[:40]}")
+    modal.add_item(discord.ui.TextInput(
+        custom_id="sys_apply_text", label=f"Wpisz {COPY_CONFIRM_WORD}, aby potwierdzić",
+        placeholder=f"Szablon ma {roles} rol i {channels} kanałów", max_length=20))
+    return modal
+
+
+async def handle_ghost_apply_modal(interaction: discord.Interaction, name: str) -> None:
+    """Odtwarza strukturę z szablonu na obecnym serwerze."""
+    if not is_authorized(interaction):
+        await interaction.response.send_message("⛔ Brak uprawnień.", ephemeral=True)
+        return
+    typed = parse_modal_value(interaction, "sys_apply_text").strip().upper()
+    layout = template_load(name)
+    if layout is None:
+        await interaction.response.send_message("❌ Szablon nie istnieje.", ephemeral=True)
+        return
+    if typed != COPY_CONFIRM_WORD:
+        await interaction.response.send_message(
+            f"❌ Potwierdzenie niepoprawne (`{typed}`) — musisz wpisać `{COPY_CONFIRM_WORD}`. "
+            "Nic nie zmieniono.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    report = await apply_guild_layout(interaction.guild, layout,
+                                      reason=f"Ghost Copy z szablonu {name} ({interaction.user})")
+    await system_log(interaction.guild, "Ghost Copy — zastosowano szablon", interaction.user,
+                     f"{name}: +{len(report['roles'])} rol, +{len(report['categories'])} kategorii, "
+                     f"+{len(report['channels'])} kanałów, błędy: {len(report['errors'])}")
+    await interaction.followup.send(embed=ghost_report_embed(f"👻 Szablon `{name}` zastosowany", report),
+                                    ephemeral=True)
+
+
+def ghost_clone_modal() -> discord.ui.Modal:
+    """Modal klonowania struktury z innego serwera (po ID)."""
+    modal = discord.ui.Modal(title="👻 Sklonuj strukturę innego serwera",
+                             custom_id="sys_clone_modal")
+    modal.add_item(discord.ui.TextInput(
+        custom_id="sys_clone_guild", label="ID serwera źródłowego",
+        placeholder="np. 123456789012345678 (bot musi na nim być)", max_length=24))
+    modal.add_item(discord.ui.TextInput(
+        custom_id="sys_clone_name", label="Zapisz też jako szablon (opcjonalnie)",
+        placeholder="np. wzor-community", max_length=40, required=False))
+    modal.add_item(discord.ui.TextInput(
+        custom_id="sys_clone_text", label=f"Wpisz {COPY_CONFIRM_WORD}, aby potwierdzić", max_length=20))
+    return modal
+
+
+async def handle_ghost_clone_modal(interaction: discord.Interaction) -> None:
+    """Klonuje strukturę innego serwera na obecny (wymaga bota na obu)."""
+    if not is_authorized(interaction):
+        await interaction.response.send_message("⛔ Brak uprawnień.", ephemeral=True)
+        return
+    typed = parse_modal_value(interaction, "sys_clone_text").strip().upper()
+    if typed != COPY_CONFIRM_WORD:
+        await interaction.response.send_message(
+            f"❌ Potwierdzenie niepoprawne — wpisz `{COPY_CONFIRM_WORD}`. Nic nie zmieniono.",
+            ephemeral=True)
+        return
+    raw_id = parse_modal_value(interaction, "sys_clone_guild").strip()
+    save_as = parse_modal_value(interaction, "sys_clone_name").strip()
+    try:
+        source_id = int(re.sub(r"[^0-9]", "", raw_id))
+    except ValueError:
+        await interaction.response.send_message("❌ To nie wygląda na ID serwera.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    source = bot.get_guild(source_id)
+    if source is None:
+        await interaction.followup.send(
+            "❌ Bot nie jest na tym serwerze — dodaj go tam i spróbuj ponownie "
+            "(albo zapisz strukturę jako szablon tam, gdzie bot jest, i użyj `/ghost`).",
+            ephemeral=True)
+        return
+    report = await clone_guild_structure(source, interaction.guild, interaction.user, save_as)
+    await system_log(interaction.guild, "Ghost Copy — klon z innego serwera", interaction.user,
+                     f"źródło: {source.name} ({source.id}), +{len(report['roles'])} rol, "
+                     f"+{len(report['channels'])} kanałów")
+    await interaction.followup.send(
+        embed=ghost_report_embed(f"👻 Sklonowano strukturę z {source.name}", report), ephemeral=True)
+
+
+async def handle_system_button(interaction: discord.Interaction, custom_id: str,
+                               values: Sequence[str] = ()) -> None:
     """Obsługa przycisków panelu /system (z autoryzacją i logowaniem)."""
     if not is_authorized(interaction):
         await system_log(interaction.guild, "Próba akcji /system bez uprawnień",
@@ -4325,7 +5272,28 @@ async def handle_system_button(interaction: discord.Interaction, custom_id: str)
 
     if custom_id == "sys_refresh":
         await interaction.response.edit_message(
-            embed=system_panel_embed(interaction.guild, interaction.user), view=system_panel_view())
+            embed=system_panel_embed(interaction.guild, interaction.user),
+            view=system_panel_view(template_list()))
+        return
+
+    if custom_id == "sys_template_save":
+        await interaction.response.send_modal(ghost_save_modal())
+        return
+
+    if custom_id == "sys_clone_from":
+        await interaction.response.send_modal(ghost_clone_modal())
+        return
+
+    if custom_id == "sys_template_pick":
+        value = str(values[0]) if values else ""
+        name = value.split(":", 1)[1] if ":" in value else ""
+        layout = template_load(name)
+        if not layout:
+            await interaction.response.send_message("❌ Szablon nie istnieje.", ephemeral=True)
+            return
+        await interaction.response.send_modal(
+            ghost_apply_modal(name, len(layout.get("roles") or []),
+                              len(layout.get("channels") or [])))
         return
 
     if custom_id == "sys_build_design":
@@ -4831,7 +5799,7 @@ async def cmd_build(interaction: discord.Interaction, wersja: app_commands.Choic
 @bot.tree.command(name="system", description="Panel zarządzania serwerem (właściciel/Admin)")
 @app_commands.default_permissions(administrator=True)
 async def cmd_system(interaction: discord.Interaction) -> None:
-    """Panel /system: design serwera + reset + logi audytowe."""
+    """Panel /system: design serwera + Ghost Copy + reset + logi audytowe."""
     if not is_authorized(interaction):
         await system_log(interaction.guild, "Próba /system bez uprawnień", interaction.user,
                          f"ID: {interaction.user.id}")
@@ -4840,7 +5808,99 @@ async def cmd_system(interaction: discord.Interaction) -> None:
         return
     await interaction.response.send_message(
         embed=system_panel_embed(interaction.guild, interaction.user),
-        view=system_panel_view(), ephemeral=True)
+        view=system_panel_view(template_list()), ephemeral=True)
+
+
+@bot.tree.command(name="ghost", description="Ghost Copy: zapisz/sklonuj strukturę serwera (admin)")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(akcja="panel / lista / zapisz / zastosuj / klonuj",
+                       nazwa="Nazwa szablonu (dla zapisz/zastosuj)",
+                       serwer="ID serwera źródłowego (dla klonuj)")
+@app_commands.choices(akcja=[
+    app_commands.Choice(name="Panel Ghost Copy", value="panel"),
+    app_commands.Choice(name="Lista szablonów", value="lista"),
+    app_commands.Choice(name="Zapisz ten serwer jako szablon", value="zapisz"),
+    app_commands.Choice(name="Zastosuj szablon", value="zastosuj"),
+    app_commands.Choice(name="Sklonuj z innego serwera", value="klonuj"),
+])
+async def cmd_ghost(interaction: discord.Interaction,
+                    akcja: Optional[app_commands.Choice[str]] = None,
+                    nazwa: str = "", serwer: str = "") -> None:
+    """Ghost Copy: pełny klon struktury serwera (role, kategorie, kanały, uprawnienia)."""
+    if not is_authorized(interaction):
+        await system_log(interaction.guild, "Próba /ghost bez uprawnień", interaction.user,
+                         f"ID: {interaction.user.id}")
+        await interaction.response.send_message("⛔ Brak uprawnień.", ephemeral=True)
+        return
+
+    action = akcja.value if akcja else "panel"
+    if action == "panel":
+        embed = discord.Embed(
+            title="👻 Ghost Copy — klonowanie serwera",
+            description=("**Co potrafi Ghost Copy:**\n"
+                         "💾 zapisuje całą strukturę (role z uprawnieniami, kategorie, kanały, "
+                         "nadpisania, tematy) jako szablon JSON,\n"
+                         "👻 odtwarza ją na dowolnym serwerze — role, permisje i układ 1:1,\n"
+                         "🌐 potrafi sklonować strukturę innego serwera, na którym jest bot.\n\n"
+                         f"**Zapisane szablony ({len(template_list())}):** "
+                         + (", ".join(f"`{n}`" for n in template_list()[:8]) if template_list()
+                            else "*brak*")
+                         + "\n\nKażda operacja wymaga wpisania "
+                           f"`{COPY_CONFIRM_WORD}` i jest logowana."),
+            color=C_PURPLE)
+        await interaction.response.send_message(embed=embed, view=system_panel_view(template_list()),
+                                                ephemeral=True)
+        return
+
+    if action == "lista":
+        names = template_list()
+        lines = []
+        for name in names[:20]:
+            layout = template_load(name) or {}
+            source = (layout.get("source") or {}).get("name", "?")
+            lines.append(f"• `{name}` — z **{source}**, {len(layout.get('roles') or [])} rol, "
+                         f"{len(layout.get('categories') or [])} kategorii, "
+                         f"{len(layout.get('channels') or [])} kanałów")
+        await interaction.response.send_message(
+            embed=discord.Embed(title=f"📁 Szablony Ghost Copy ({len(names)})",
+                                description="\n".join(lines) or "*Brak szablonów — zapisz pierwszy.*",
+                                color=C_BLUE), ephemeral=True)
+        return
+
+    if action == "zapisz":
+        if not nazwa:
+            await interaction.response.send_message("❌ Podaj nazwę: `/ghost akcja:zapisz nazwa:moj-szablon`.",
+                                                    ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        layout = export_guild_layout(interaction.guild)
+        path = template_save(nazwa, layout)
+        await system_log(interaction.guild, "Ghost Copy — zapis szablonu", interaction.user, path.name)
+        await interaction.followup.send(
+            f"💾 Szablon `{path.stem}` zapisany ({len(layout['roles'])} rol, "
+            f"{len(layout['channels'])} kanałów).", ephemeral=True)
+        return
+
+    if action == "zastosuj":
+        if not nazwa:
+            await interaction.response.send_message("❌ Podaj nazwę szablonu: `/ghost akcja:zastosuj nazwa:...`.",
+                                                    ephemeral=True)
+            return
+        layout = template_load(nazwa)
+        if not layout:
+            await interaction.response.send_message("❌ Nie znam takiego szablonu.", ephemeral=True)
+            return
+        await interaction.response.send_modal(
+            ghost_apply_modal(nazwa, len(layout.get("roles") or []), len(layout.get("channels") or [])))
+        return
+
+    if action == "klonuj":
+        if not re.sub(r"[^0-9]", "", serwer or ""):
+            await interaction.response.send_message("❌ Podaj ID serwera: `/ghost akcja:klonuj serwer:123...`.",
+                                                    ephemeral=True)
+            return
+        await interaction.response.send_modal(ghost_clone_modal())
+        return
 
 # ============================================================================
 # 26. START
