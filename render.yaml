@@ -1,0 +1,49 @@
+# ============================================================
+#  FIVEM MOD FOUNDRY — deploy na Render (Python, 1 klik)
+#
+#  1. Wrzuć to repo na GitHub.
+#  2. Render -> New -> Blueprint -> wskaż repo (przeczyta ten plik).
+#  3. Uzupełnij sekrety (sync: false) w panelu Render:
+#     DISCORD_TOKEN, CLIENT_ID, YOUTUBE_API_KEY, PUBLIC_URL, SKIN_INDEX_URL.
+#
+#  UWAGA: darmowy plan Render usypia usługę, a bot Discord musi działać 24/7.
+#  Wybierz plan płatny (starter) albo hosting na VPS.
+# ============================================================
+services:
+  - type: web
+    name: fivem-citizen-bot
+    runtime: python
+    plan: starter                     # najtańszy płatny plan; darmowy usypia usługę
+    region: frankfurt                 # najbliżej Polski (opcjonalne)
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /health
+    autoDeploy: true                  # automatyczny deploy po pushu na GitHub
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: HTTP_PORT
+        value: "3000"
+      - key: GAME_BUILD
+        value: latest
+      - key: YT_SCAN_MINUTES
+        value: "15"
+      - key: ZIP_QUEUE_CONCURRENCY
+        value: "2"
+      - key: DOWNLOAD_TTL_MINUTES
+        value: "60"
+      - key: CHANNEL_CLEANUP_MINUTES
+        value: "15"
+      - key: MAX_DOWNLOAD_MB
+        value: "200"
+      # --- sekrety: wpisujesz w panelu Render, NIE w repozytorium ---
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: CLIENT_ID
+        sync: false
+      - key: YOUTUBE_API_KEY
+        sync: false
+      - key: PUBLIC_URL               # np. https://fivem-citizen-bot.onrender.com
+        sync: false
+      - key: SKIN_INDEX_URL
+        sync: false
