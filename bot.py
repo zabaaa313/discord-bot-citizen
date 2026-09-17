@@ -5610,7 +5610,7 @@ def _expired_page() -> web.Response:
 
 
 async def http_citizen_page(request: web.Request) -> web.Response:
-    """GET /create/citizen/{token}/page — aktualny krok citizena."""
+    """GET /create/citizen/{token}/page — zakładki + siatka wszystkich opcji."""
     sess = await _web_session_or_404(request)
     if not sess:
         return _expired_page()
@@ -5619,29 +5619,46 @@ async def http_citizen_page(request: web.Request) -> web.Response:
         content_type="text/html")
 
 
+def _citizen_step_by_id(step_id: str) -> Optional[Dict[str, Any]]:
+    return next((s for s in CITIZEN_STEPS if s["id"] == step_id), None)
+
+
+def _toggle_id(ids: List[str], step_id: str) -> None:
+    """Klik na kartę: wybiera albo odznacza opcję (zachowuje kolejność wyboru)."""
+    if step_id in ids:
+        ids.remove(step_id)
+    else:
+        ids.append(step_id)
+
+
 async def http_citizen_action(request: web.Request) -> web.Response:
-    """GET /create/citizen/{token}/pick|skip|back/{index} — akcja gracza."""
+    """
+    GET /create/citizen/{token}/{action}/{value}
+      action=tab    — przełącz zakładkę (value = slug grupy)
+      action=toggle — wybierz/odznacz opcję (value = id kroku)
+    """
     sess = await _web_session_or_404(request)
     if not sess:
         return _expired_page()
+    token = request.match_info["token"]
     action = request.match_info["action"]
-    index = int(request.match_info["index"])
-    steps = CITIZEN_STEPS
-    if action == "pick" and 0 <= index < len(steps):
-        sid = steps[index]["id"]
-        if sid not in sess["citizen_ids"]:
-            sess["citizen_ids"].append(sid)
-    elif action == "back" and index > 0:
-        # cofamy ostatni wybór (niezależnie od indexu — wracamy o jeden krok)
-        if sess["citizen_ids"]:
-            sess["citizen_ids"].pop()
-        if len(sess["citizen_ids"]) < index - 1:
-            pass
-    raise web.HTTPFound(f"/create/citizen/{request.match_info['token']}/page")
+    value = request.match_info.get("value") or request.match_info.get("index", "")
+    if action == "toggle" and value:
+        step = _citizen_step_by_id(value)
+        if step is not None:
+            _toggle_id(sess["citizen_ids"], value)
+            sess.setdefault("name_cache", {})[value] = str(step["name"])
+        raise web.HTTPFound(f"/create/citizen/{token}/page")
+    if action == "tab":
+        # zakładka: po prostu renderujemy stronę ponownie (grupa w value)
+        return web.Response(text=render_citizen_page(
+            token, sess, CITIZEN_STEPS, _citizen_img_url, group=web_creator.unslug(value)),
+            content_type="text/html")
+    raise web.HTTPFound(f"/create/citizen/{token}/page")
 
 
 async def http_skins_page(request: web.Request) -> web.Response:
-    """GET /create/skins/{token}/page — aktualny skin na ekranie."""
+    """GET /create/skins/{token}/page — zakładka broni + siatka skinów."""
     sess = await _web_session_or_404(request)
     if not sess:
         return _expired_page()
@@ -5651,36 +5668,41 @@ async def http_skins_page(request: web.Request) -> web.Response:
 
 
 async def http_skins_action(request: web.Request) -> web.Response:
-    """GET /create/skins/{token}/pick|skip|back|weapon/..."""
+    """
+    GET /create/skins/{token}/{action}/{value}
+      action=weapon — przełącz zakładkę broni
+      action=toggle — wybierz/odznacz skin (value = id skina)
+    """
     sess = await _web_session_or_404(request)
     if not sess:
         return _expired_page()
+    token = request.match_info["token"]
     action = request.match_info["action"]
     value = request.match_info.get("value") or request.match_info.get("index", "")
+    weapons = all_weapons()
     if action == "weapon" and value:
         sess["weapon"] = value
-    elif action == "pick":
-        weapon = next((w for w in all_weapons() if w["id"] == sess["weapon"]), None)
-        if weapon:
-            idx = int(value)
-            if 0 <= idx < len(weapon["skins"]):
-                sid = weapon["skins"][idx]["id"]
-                if sid not in sess["skin_ids"]:
-                    sess["skin_ids"].append(sid)
-    elif action == "back":
-        if sess["skin_ids"]:
-            sess["skin_ids"].pop()
-    raise web.HTTPFound(f"/create/skins/{request.match_info['token']}/page")
+    elif action == "toggle" and value:
+        skin = next((s for w in weapons for s in w["skins"] if s["id"] == value), None)
+        if skin is not None:
+            _toggle_id(sess["skin_ids"], value)
+            wname = next((w["name"] for w in weapons
+                          if any(s["id"] == value for s in w["skins"])), "")
+            sess.setdefault("name_cache", {})[value] = f"{wname} — {skin['name']}"
+    raise web.HTTPFound(f"/create/skins/{token}/page")
 
 
 async def http_create_finish(request: web.Request) -> web.Response:
     """
-    GET /create/finish/{token} — buduje paczkę z wyborów z kreatora WWW.
-    Zwraca stronę z linkiem /download/<token> + (przy oknie bota) wrzuca na Discord.
+    POST /create/finish/{token} — buduje paczkę z wyborów z kreatora WWW
+    (przycisk „📦 Zbuduj paczkę” w panelu bocznym). Zwraca ekran z linkiem.
     """
     sess = await _web_session_or_404(request)
     if not sess:
         return _expired_page()
+    if request.method == "GET":
+        # stare linki GET -> pokaz kreator (bez budowy)
+        raise web.HTTPFound(f"/create/{sess['kind']}/{request.match_info['token']}/page")
 
     # Budowa paczki w połowie synchronicznie (to endpoint HTTP — krótkie operacje OK)
     workspace = WORKSPACES_DIR / f"web-{sess['user_id']}-{int(time.time())}"
@@ -5709,29 +5731,20 @@ async def http_create_finish(request: web.Request) -> web.Response:
         await asyncio.to_thread(zip_directory, workspace, zip_path)
         size = zip_path.stat().st_size
         file_count = count_files(workspace)
-        token = STORAGE.register(zip_path, zip_name, size, file_count,
-                                int(sess["user_id"]) if sess["user_id"].isdigit() else 0,
-                                workspace)
-        public = public_download_url(token)
-        download_url = public if public else f"/download/{token}"  # localhost: link względny
+        dl_token = STORAGE.register(zip_path, zip_name, size, file_count,
+                                    int(sess["user_id"]) if sess["user_id"].isdigit() else 0,
+                                    workspace)
+        public = public_download_url(dl_token)
+        download_url = public if public else f"/download/{dl_token}"  # localhost: link względny
     except Exception as exc:  # noqa: BLE001
         await notify_error("Kreator WWW: błąd budowy paczki", str(exc), exc, "web_finish")
         return web.Response(text="<meta charset='utf-8'><body style='font-family:sans-serif;"
                                  "background:#0b0d13;color:#ed4245;display:grid;place-items:center;"
                                  "height:100vh'><h1>Coś się posypało — spróbuj ponownie.</h1>",
                             content_type="text/html", status=500)
-
-    main = f"""
-<div class="done-panel">
-  <div class="big">✅</div>
-  <h2>Paczka gotowa!</h2>
-  <p>ZIP zawiera tylko pliki z Twoich wyborów (hasze SHA-256 w HASHES.txt).</p>
-  <div class="actions" style="justify-content:center">
-    <a class="btn btn-primary" href="{html.escape(download_url)}">⬇️ Pobierz paczkę</a>
-    <a class="btn btn-ghost" href="/create">🏗️ Następna paczka</a>
-  </div>
-</div>"""
-    return web.Response(text=_page_html("Paczka gotowa", "zbudowano", main), content_type="text/html")
+    return web.Response(text=web_creator.render_pack_done(
+        request.match_info["token"], download_url, kind, file_count, size / (1024 * 1024)),
+        content_type="text/html")
 
 
 def _page_html(title: str, chip: str, main_html: str) -> str:
@@ -5852,11 +5865,12 @@ def create_http_app() -> web.Application:
     app.router.add_get("/create", http_create_home)
     app.router.add_get("/create/citizen", http_create_citizen)
     app.router.add_get("/create/citizen/{token}/page", http_citizen_page)
-    app.router.add_get("/create/citizen/{token}/{action}/{index}", http_citizen_action)
+    app.router.add_get("/create/citizen/{token}/{action}/{value}", http_citizen_action)
     app.router.add_get("/create/skins", http_create_skins)
     app.router.add_get("/create/skins/{token}/page", http_skins_page)
     app.router.add_get("/create/skins/{token}/{action}/{value}", http_skins_action)
-    app.router.add_get("/create/finish/{token}", http_create_finish)
+    app.router.add_get("/create/finish/{token}", http_create_finish)  # GET = redirect do kreatora
+    app.router.add_post("/create/finish/{token}", http_create_finish)  # POST = buduje paczkę
     app.router.add_get("/api/pack/{token}", http_api_pack)
     app.router.add_get("/api/profile/{user_id}", http_api_profile)
     app.router.add_get("/api/bridge/inbox", http_api_bridge_inbox)
