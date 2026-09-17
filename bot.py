@@ -51,6 +51,9 @@ from aiohttp import web
 from discord import app_commands
 from dotenv import load_dotenv
 
+# .env szukamy najpierw obok pliku bot.py (działa też, gdy plik leży na Pulpicie),
+# potem w katalogu bieżącym — jak dotychczas.
+load_dotenv(Path(__file__).parent / ".env")
 load_dotenv()
 
 # ============================================================================
@@ -309,6 +312,9 @@ def _skin(sid: str, name: str, desc: str, image: str, url: str, file_name: str,
     }
 
 
+# UWAGA: lista celowo OGRANICZONA do 4 broni (życzenie użytkownika):
+#   pistol / pistolmk2 / vintagepistol / snspistol.
+#   Wszystkie są w kategorii "pistols" — resztę kategorii i broni usunięto.
 WEAPON_CATEGORIES: List[Dict[str, Any]] = [
     {
         "id": "pistols",
@@ -322,110 +328,24 @@ WEAPON_CATEGORIES: List[Dict[str, Any]] = [
                 _skin("pistol-jungle", "Jungle Camo", "Zielony kamuflaż dżungla.", "PISTOL_JUNGLE", "pistol_jungle.ytd", "w_pi_pistol.ytd"),
                 _skin("pistol-bloodline", "Bloodline", "Czarno-czerwone cięcia.", "PISTOL_BLOOD", "pistol_bloodline.ytd", "w_pi_pistol.ytd"),
             ]},
-            {"id": "pistol50", "name": "Pistol .50", "skins": [
-                _skin("pistol50-gold", "Gold", "Pełny złoty szkielet.", "P50_GOLD", "pistol50_gold.ytd", "w_pi_pistol50.ytd"),
-                _skin("pistol50-chrome", "Chrome", "Chromowany połysk jak lustro.", "P50_CHROME", "pistol50_chrome.ytd", "w_pi_pistol50.ytd"),
-                _skin("pistol50-black", "Stealth Black", "Matowa czerń bez odbić.", "P50_BLACK", "pistol50_black.ytd", "w_pi_pistol50.ytd"),
-            ]},
-            {"id": "heavypistol", "name": "Heavy Pistol", "skins": [
-                _skin("heavypistol-chrome", "Chrome", "Chromowany połysk.", "HEAVY_CHROME", "heavypistol_chrome.ytd", "w_pi_histol.ytd"),
-                _skin("heavypistol-gold", "Gold", "Złote wykończenie z drewnianym chwytem.", "HEAVY_GOLD", "heavypistol_gold.ytd", "w_pi_histol.ytd"),
-                _skin("heavypistol-digital", "Digital Camo", "Pikselowy kamuflaż ACU.", "HEAVY_DIGI", "heavypistol_digital.ytd", "w_pi_histol.ytd"),
-            ]},
-            {"id": "appistol", "name": "AP Pistol", "skins": [
-                _skin("appistol-carbon", "Carbon Fiber", "Węglowy wzór.", "AP_CARBON", "appistol_carbon.ytd", "w_pi_ap_pistol.ytd"),
-                _skin("appistol-viper", "Viper", "Jadowita zieleń na czerni.", "AP_VIPER", "appistol_viper.ytd", "w_pi_ap_pistol.ytd"),
-                _skin("appistol-frost", "Frost", "Lodowy błękit z białym szronem.", "AP_FROST", "appistol_frost.ytd", "w_pi_ap_pistol.ytd"),
-            ]},
-            {"id": "combatpistol", "name": "Combat Pistol", "skins": [
-                _skin("combatpistol-tan", "Desert Tan", "Pustynny kamuflaż.", "COMBAT_TAN", "combatpistol_tan.ytd", "w_pi_combatpistol.ytd"),
-                _skin("combatpistol-black", "Night Ops", "Czerń + szare elementy taktyczne.", "COMBAT_BLACK", "combatpistol_black.ytd", "w_pi_combatpistol.ytd"),
-                _skin("combatpistol-miami", "Miami", "Różowo-błękitny neon z lat 80.", "COMBAT_MIAMI", "combatpistol_miami.ytd", "w_pi_combatpistol.ytd"),
-            ]},
             {"id": "pistolmk2", "name": "Pistol Mk II", "skins": [
                 _skin("pistolmk2-camo", "Splinter Camo", "Kamuflaż łupany (splinter).", "MK2_CAMO", "pistolmk2_camo.ytd", "w_pi_pistolmk2.ytd"),
                 _skin("pistolmk2-gold", "Gold Bullion", "Sztabka złota na zamku.", "MK2_GOLD", "pistolmk2_gold.ytd", "w_pi_pistolmk2.ytd"),
-            ]},
-            {"id": "snspistol", "name": "SNS Pistol", "skins": [
-                _skin("snspistol-gold", "Gold", "Złoty kieszonkowiec.", "SNS_GOLD", "snspistol_gold.ytd", "w_pi_sns_pistol.ytd"),
-                _skin("snspistol-chrome", "Chrome", "Chrom z białym chwytem.", "SNS_CHROME", "snspistol_chrome.ytd", "w_pi_sns_pistol.ytd"),
-            ]},
-            {"id": "ceramicpistol", "name": "Ceramic Pistol", "skins": [
-                _skin("ceramicpistol-black", "Ceramic Black", "Matowa ceramika.", "CERAMIC_BLACK", "ceramicpistol_black.ytd", "w_pi_ceramic_pistol.ytd"),
-                _skin("ceramicpistol-gold", "Ceramic Gold", "Ceramika ze złotym szlakiem.", "CERAMIC_GOLD", "ceramicpistol_gold.ytd", "w_pi_ceramic_pistol.ytd"),
-            ]},
-            {"id": "rev_heavy", "name": "Heavy Revolver", "skins": [
-                _skin("rev_heavy-chrome", "Chrome", "Chromowany rewolwer.", "REV_CHROME", "rev_heavy_chrome.ytd", "w_pi_revolver.ytd"),
-                _skin("rev_heavy-gold", "Gold Rush", "Złoto z orzechem na chwycie.", "REV_GOLD", "rev_heavy_gold.ytd", "w_pi_revolver.ytd"),
-                _skin("rev_heavy-engraved", "Engraved", "Grawerowane ornamenty.", "REV_ENGRAVED", "rev_heavy_engraved.ytd", "w_pi_revolver.ytd"),
-            ]},
-            {"id": "navyrevolver", "name": "Navy Revolver", "skins": [
-                _skin("navyrevolver-gold", "Gold", "Złoty klasyk z epoki.", "NAVY_GOLD", "navyrevolver_gold.ytd", "w_pi_navyrevolver.ytd"),
-                _skin("navyrevolver-wood", "Dark Wood", "Ciemne drewno + stal.", "NAVY_WOOD", "navyrevolver_wood.ytd", "w_pi_navyrevolver.ytd"),
             ]},
             {"id": "vintagepistol", "name": "Vintage Pistol", "skins": [
                 _skin("vintagepistol-gold", "Gold", "Złoty vintage.", "VINTAGE_GOLD", "vintagepistol_gold.ytd", "w_pi_vintage_pistol.ytd"),
                 _skin("vintagepistol-black", "Bakelite", "Czarny bakelit z lat 50.", "VINTAGE_BLACK", "vintagepistol_black.ytd", "w_pi_vintage_pistol.ytd"),
             ]},
-        ],
-    },
-    {
-        "id": "smg",
-        "name": "💥 SMG",
-        "weapons": [
-            {"id": "microsmg", "name": "Micro SMG", "skins": [
-                _skin("microsmg-redline", "Redline", "Czerwone paski na czerni.", "MICRO_REDLINE", "microsmg_redline.ytd", "w_sb_microsmg.ytd"),
-                _skin("microsmg-gold", "Gold", "Złota kompaktowa SMG.", "MICRO_GOLD", "microsmg_gold.ytd", "w_sb_microsmg.ytd"),
+            {"id": "snspistol", "name": "SNS Pistol", "skins": [
+                _skin("snspistol-gold", "Gold", "Złoty kieszonkowiec.", "SNS_GOLD", "snspistol_gold.ytd", "w_pi_sns_pistol.ytd"),
+                _skin("snspistol-chrome", "Chrome", "Chrom z białym chwytem.", "SNS_CHROME", "snspistol_chrome.ytd", "w_pi_sns_pistol.ytd"),
             ]},
-            {"id": "smg", "name": "SMG", "skins": [
-                _skin("smg-woodland", "Woodland", "Leśny kamuflaż.", "SMG_WOODLAND", "smg_woodland.ytd", "w_sb_smg.ytd"),
-                _skin("smg-digital", "Digital", "Pikselowy kamuflaż.", "SMG_DIGITAL", "smg_digital.ytd", "w_sb_smg.ytd"),
-            ]},
-            {"id": "assaultsmg", "name": "Assault SMG", "skins": [
-                _skin("assaultsmg-white", "Arctic", "Biały arktyczny kamuflaż.", "ASMG_ARCTIC", "assaultsmg_arctic.ytd", "w_sb_assaultsmg.ytd"),
-                _skin("assaultsmg-purple", "Royal Purple", "Fiolet z chromem.", "ASMG_PURPLE", "assaultsmg_purple.ytd", "w_sb_assaultsmg.ytd"),
+            {"id": "snspistolmk2", "name": "SNS Pistol Mk II", "skins": [
+                _skin("snspistolmk2-tiger", "Tiger", "Tygrysi kamuflaż na czerni.", "SNSMK2_TIGER", "snspistolmk2_tiger.ytd", "w_pi_sns_pistolmk2.ytd"),
+                _skin("snspistolmk2-royal", "Royal", "Królewski fiolet ze złotem.", "SNSMK2_ROYAL", "snspistolmk2_royal.ytd", "w_pi_sns_pistolmk2.ytd"),
             ]},
         ],
     },
-    {
-        "id": "rifles",
-        "name": "🎯 Karabiny",
-        "weapons": [
-            {"id": "carbine", "name": "Carbine Rifle", "skins": [
-                _skin("carbine-tan", "Desert Tan", "Pustynny kamuflaż.", "CARBINE_TAN", "carbine_tan.ytd", "w_ar_carbine.ytd"),
-                _skin("carbine-gold", "Gold", "Złoty karabin kolekcjonerski.", "CARBINE_GOLD", "carbine_gold.ytd", "w_ar_carbine.ytd"),
-                _skin("carbine-splinter", "Splinter", "Kamuflaż łupany.", "CARBINE_SPLINTER", "carbine_splinter.ytd", "w_ar_carbine.ytd"),
-            ]},
-            {"id": "ak47", "name": "AK-47 (Assault Rifle)", "skins": [
-                _skin("ak47-redline", "Redline", "Czerwone linie na czerni.", "AK_REDLINE", "ak47_redline.ytd", "w_ar_assaultrifle.ytd"),
-                _skin("ak47-gold", "Gold Dragon", "Złoty smok na korpusie.", "AK_GOLD", "ak47_gold.ytd", "w_ar_assaultrifle.ytd"),
-                _skin("ak47-relic", "Relic Wood", "Stare drewno, zużyta stal.", "AK_RELIC", "ak47_relic.ytd", "w_ar_assaultrifle.ytd"),
-            ]},
-            {"id": "specialcarbine", "name": "Special Carbine", "skins": [
-                _skin("specialcarbine-black", "Black Market", "Czerń z mosiądzem.", "SCARB_BLACK", "specialcarbine_black.ytd", "w_ar_specialcarbine.ytd"),
-                _skin("specialcarbine-neon", "Neon Grid", "Neonowa siatka na korpusie.", "SCARB_NEON", "specialcarbine_neon.ytd", "w_ar_specialcarbine.ytd"),
-            ]},
-        ],
-    },
-    {"id": "shotguns", "name": "🦆 Strzelby", "weapons": [
-            {"id": "pumpshotgun", "name": "Pump Shotgun", "skins": [
-                _skin("pump-gold", "Gold Edition", "Złote wykończenie.", "PUMP_GOLD", "pump_gold.ytd", "w_sg_pumpshotgun.ytd"),
-                _skin("pump-tactical", "Tactical", "Taktyczna czerń z latarką.", "PUMP_TACTICAL", "pump_tactical.ytd", "w_sg_pumpshotgun.ytd"),
-            ]},
-            {"id": "sawnoff", "name": "Sawed-Off Shotgun", "skins": [
-                _skin("sawnoff-rust", "Rust", "Zardzewiały złom.", "SAW_RUST", "sawnoff_rust.ytd", "w_sg_sawnoff.ytd"),
-                _skin("sawnoff-chrome", "Chrome", "Chrom z czarnym chwytem.", "SAW_CHROME", "sawnoff_chrome.ytd", "w_sg_sawnoff.ytd"),
-            ]},
-        ]},
-    {"id": "machineguns", "name": "🧨 Broń maszynowa", "weapons": [
-            {"id": "mg", "name": "MG", "skins": [
-                _skin("mg-desert", "Desert Storm", "Pustynny kamuflaż pustynna burza.", "MG_DESERT", "mg_desert.ytd", "w_mg_mg.ytd"),
-                _skin("mg-tiger", "Tiger", "Tygrysie pasy.", "MG_TIGER", "mg_tiger.ytd", "w_mg_mg.ytd"),
-            ]},
-            {"id": "combatmg", "name": "Combat MG", "skins": [
-                _skin("combatmg-black", "Blackout", "Całkowicie czarny.", "CMG_BLACK", "combatmg_black.ytd", "w_mg_combatmg.ytd"),
-            ]},
-        ]},
 ]
 
 # ============================================================================
@@ -3800,6 +3720,12 @@ def _score(item: Dict[str, Any], tokens: Sequence[str]) -> int:
     return score
 
 
+# Broń, których dotyczy wyszukiwarka skinów .rpf (życzenie użytkownika):
+#   pistol / pistolmk2 / vintagepistol / snspistol (+ snspistolmk2).
+ALLOWED_WEAPON_IDS = {"pistol", "pistolmk2", "vintagepistol", "snspistol", "snspistolmk2"}
+ALLOWED_WEAPON_TOKENS = tuple(sorted(ALLOWED_WEAPON_IDS))
+
+
 async def search_skins(query: str) -> Dict[str, Any]:
     """Wyszukuje skiny w indeksie — zwraca TYLKO pliki .rpf."""
     if not query or len(query.strip()) < 2:
@@ -3813,6 +3739,14 @@ async def search_skins(query: str) -> Dict[str, Any]:
     results = []
     for item in index:
         if not is_rpf(item.get("fileUrl", "")):
+            continue
+        # LIMIT BRONI: tylko pistol / pistolmk2 / vintagepistol / snspistol (+ Mk II).
+        haystack = " ".join((
+            _normalize(item.get("name", "")), _normalize(item.get("description", "")),
+            " ".join(_normalize(t) for t in (item.get("tags") or [])),
+            _normalize(item.get("weapon", "")), _normalize(item.get("id", "")),
+        ))
+        if not any(token in haystack for token in ALLOWED_WEAPON_TOKENS):
             continue
         score = _score(item, tokens)
         if score > 0:
@@ -5984,6 +5918,7 @@ class FoundryBot(discord.Client):
         asyncio.create_task(scanner_loop(self))
         asyncio.create_task(sweeper_loop(self))
         asyncio.create_task(precache_items())          # zapas plików = natychmiastowe paczki
+        asyncio.create_task(_heartbeat_loop())         # watchdog 24/7: godzinny heartbeat
 
     async def on_ready(self) -> None:
         core_log.info("Zalogowano jako %s", self.user)
@@ -7206,7 +7141,10 @@ async def cmd_status(interaction: discord.Interaction) -> None:
                      f"sesje {megabytes(disk['workspaces'])}, cache {megabytes(disk['cache'])}, "
                      f"logi {megabytes(disk['logs'])}\n"
                      f"♻️ GC: {stats['gc_runs']} cykli, usunięto {stats['deleted']} paczek "
-                     f"({megabytes(stats['freed_bytes'])} zwolnione)"),
+                     f"({megabytes(stats['freed_bytes'])} zwolnione)\n\n"
+                     f"🛡️ **Watchdog 24/7:** {'🟢 aktywny' if WATCHDOG_ENABLED else '🔴 wyłączony'} • "
+                     f"restarty: **{WATCHDOG_RESTARTS}** • ostatnia awaria: "
+                     f"{WATCHDOG_LAST_CRASH.splitlines()[0][:60] if WATCHDOG_LAST_CRASH else 'brak'}"),
         color=C_BLUE)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -7637,9 +7575,124 @@ def main() -> None:
     except discord.LoginFailure:
         core_log.error("Niepoprawny DISCORD_TOKEN — sprawdź token w .env.")
         raise SystemExit(1)
-    except KeyboardInterrupt:  # pragma: no cover
-        core_log.warning("Zatrzymano bota (Ctrl+C).")
+
+
+# ----------------------------------------------------------------------------
+# WATCHDOG 24/7 — bot ZAWSZE włączony (całość w kodzie, zero zewnętrznych skryptów)
+#
+#   • awaria / crash / utrata internetu   -> restart po WATCHDOG_RESTART_DELAY s
+#   • brak tokenów lub zły token w .env   -> czeka WATCHDOG_CONFIG_DELAY s,
+#     PRZEŁADOWUJE .env i próbuje dalej (wpiszesz tokeny = bot sam wstaje)
+#   • czyste zamknięcie bez Ctrl+C        -> też restart (bot nigdy sam nie gaśnie)
+#   • godzinny heartbeat do logs/bot.log  -> widać, że bot cały czas żyje
+#   • licznik restartów + ostatnia awaria widoczne w komendzie /status
+#   • JEDYNY sposób zatrzymania: Ctrl+C w oknie bota
+#   • wyłączenie watchdoga: WATCHDOG_ENABLED=0 w .env
+# ----------------------------------------------------------------------------
+
+WATCHDOG_ENABLED = os.getenv("WATCHDOG_ENABLED", "1").strip().lower() not in ("0", "false", "no")
+WATCHDOG_RESTART_DELAY = max(5, int(os.getenv("WATCHDOG_RESTART_DELAY", "15") or 15))
+WATCHDOG_CONFIG_DELAY = max(30, int(os.getenv("WATCHDOG_CONFIG_DELAY", "60") or 60))
+WATCHDOG_HEARTBEAT_MINUTES = max(0, int(os.getenv("WATCHDOG_HEARTBEAT_MINUTES", "60") or 60))
+
+WATCHDOG_STARTED_AT = time.time()
+WATCHDOG_RESTARTS = 0
+WATCHDOG_LAST_CRASH: str = ""
+_STOP_REQUESTED = False  # flaga Ctrl+C (discord.py połyka KeyboardInterrupt)
+
+try:  # noqa: E402 — sygnały są dostępne tylko na pełnym interpreterze
+    import signal
+except ImportError:  # pragma: no cover
+    signal = None  # type: ignore[assignment]
+
+
+def _watchdog_sigint(signum: int, frame: Any) -> None:
+    """Ctrl+C ustawia flagę stopu — jedyny legalny sposób wyłączenia bota."""
+    global _STOP_REQUESTED
+    _STOP_REQUESTED = True
+
+
+def _watchdog_reload_env() -> bool:
+    """
+    Przeładowuje .env i odświeża tokeny w globalnych zmiennych.
+    Zwraca True, gdy konfiguracja wygląda kompletna.
+    Dzięki temu bot podniesie się sam, gdy user dopisze tokeny do .env.
+    """
+    global DISCORD_TOKEN, CLIENT_ID, YOUTUBE_API_KEY, SKIN_INDEX_URL
+    load_dotenv(override=True)
+    DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
+    CLIENT_ID = os.getenv("CLIENT_ID", "").strip()
+    YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
+    SKIN_INDEX_URL = os.getenv("SKIN_INDEX_URL", "").strip()
+    return bool(DISCORD_TOKEN and CLIENT_ID)
+
+
+async def _heartbeat_loop() -> None:
+    """Godzinny heartbeat do logu — świadczy, że bot cały czas działa."""
+    interval = max(1, WATCHDOG_HEARTBEAT_MINUTES) * 60
+    await asyncio.sleep(30)
+    while True:
+        uptime_h = (time.time() - WATCHDOG_STARTED_AT) / 3600
+        last = (WATCHDOG_LAST_CRASH.splitlines() or ["brak"])[0][:100]
+        core_log.info("Watchdog heartbeat: bot działa, uptime %.1f h, restarty: %s, ostatnia awaria: %s",
+                      uptime_h, WATCHDOG_RESTARTS, last)
+        await asyncio.sleep(interval)
+
+
+def _watchdog() -> None:
+    """Uruchamia bota w nieskończonej pętli — nigdy nie zostaje wyłączony."""
+    global WATCHDOG_RESTARTS, WATCHDOG_LAST_CRASH
+    if signal is not None:
+        try:
+            signal.signal(signal.SIGINT, _watchdog_sigint)
+        except (ValueError, OSError):  # pragma: no cover — nie w głównym wątku
+            pass
+    attempt = 0
+    _watchdog_reload_env()
+    while True:
+        attempt += 1
+        config_problem = False
+        try:
+            main()
+            # bot.run() zwrócił bez wyjątku — gdy to NIE był Ctrl+C, podnosimy dalej
+            if _STOP_REQUESTED:
+                core_log.warning(
+                    "Watchdog: zatrzymano ręcznie (Ctrl+C) — kończę. Uptime: %.1f h, restarty: %s.",
+                    (time.time() - WATCHDOG_STARTED_AT) / 3600, WATCHDOG_RESTARTS)
+                return
+            core_log.warning("Watchdog: bot został zamknięty bez Ctrl+C — podnoszę go ponownie.")
+        except KeyboardInterrupt:
+            if _STOP_REQUESTED:
+                core_log.warning("Watchdog: zatrzymano ręcznie (Ctrl+C) — kończę.")
+                return
+            core_log.warning("Watchdog: przerwano bez flagi stopu — podnoszę bota ponownie.")
+        except SystemExit as exc:
+            # Brak tokenów / zły token: NIE poddajemy się — czekamy na poprawkę .env
+            # i próbujemy dalej (przed kolejną próbą przeładowujemy .env).
+            config_problem = True
+            WATCHDOG_LAST_CRASH = f"SystemExit({exc.code})"
+            core_log.error(
+                "Watchdog: problem z konfiguracją (kod %s) — czekam na poprawkę .env "
+                "i ponawiam próbę co %s s. Bot pozostaje włączony.",
+                exc.code, WATCHDOG_CONFIG_DELAY)
+        except Exception:
+            WATCHDOG_RESTARTS += 1
+            WATCHDOG_LAST_CRASH = traceback.format_exc(limit=3)
+            core_log.error("Watchdog: awaria #%s:\n%s", attempt, WATCHDOG_LAST_CRASH)
+
+        if not WATCHDOG_ENABLED:
+            core_log.error("Watchdog wyłączony (WATCHDOG_ENABLED=0) — kończę po awarii.")
+            return
+
+        delay = WATCHDOG_CONFIG_DELAY if config_problem else WATCHDOG_RESTART_DELAY
+        _watchdog_reload_env()               # świeże tokeny z .env bez restartu komputera
+        if config_problem and DISCORD_TOKEN and CLIENT_ID:
+            core_log.info("Watchdog: .env wygląda uzupełniony — restartuję natychmiast.")
+            delay = 1
+        core_log.warning("Watchdog: restart bota za %s s (próba #%s, dotychczasowe restarty: %s).",
+                         delay, attempt, WATCHDOG_RESTARTS)
+        time.sleep(delay)
 
 
 if __name__ == "__main__":
-    main()
+    _watchdog()
