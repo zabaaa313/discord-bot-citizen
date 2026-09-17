@@ -51,6 +51,23 @@ from aiohttp import web
 from discord import app_commands
 from dotenv import load_dotenv
 
+# Generator plików citizena (te same pliki, zmienione wartości)
+from citizen_gen import (
+    CITIZEN_GENERATED_STEPS,
+    SKY_PRESETS,
+    generate_citizen_file,
+)
+# Kreator WWW (ładna strona: 1 opcja na ekran + duży podgląd)
+import web_creator
+from web_creator import (
+    WEB_SESSIONS,
+    web_session_create,
+    web_session_get,
+    render_citizen_page,
+    render_skins_page,
+    render_home_page,
+)
+
 # .env szukamy najpierw obok pliku bot.py (działa też, gdy plik leży na Pulpicie),
 # potem w katalogu bieżącym — jak dotychczas.
 load_dotenv(Path(__file__).parent / ".env")
@@ -143,7 +160,7 @@ QUEUE_NOTIFY = os.getenv("QUEUE_NOTIFY", "1").strip().lower() not in ("0", "fals
 # --- Paginacja (Discord limituje select do 25 opcji) ---
 SKINS_PER_PAGE = max(5, int(os.getenv("SKINS_PER_PAGE", "24") or 24))
 SEARCH_RESULTS_PER_PAGE = max(3, int(os.getenv("SEARCH_RESULTS_PER_PAGE", "8") or 8))
-STEPS_PER_PAGE = max(5, int(os.getenv("STEPS_PER_PAGE", "24") or 24))
+STEPS_PER_PAGE = max(25, int(os.getenv("STEPS_PER_PAGE", "25") or 25))
 # --- Własne pliki graczy (przycisk 📎) — bez hostingu, prosto z Discorda ---
 UPLOAD_MAX_MB = max(1, int(os.getenv("UPLOAD_MAX_MB", "25") or 25))
 UPLOAD_MAX_FILES = max(1, int(os.getenv("UPLOAD_MAX_FILES", "20") or 20))
@@ -255,38 +272,16 @@ def _step(group: str, sid: str, name: str, desc: str, image: str,
     }
 
 
-CITIZEN_STEPS: List[Dict[str, str]] = [
-    # ---- GRUPA 1: ŚRODOWISKO ----
-    _step(G1, "sky-clear", "Czyste niebo", "Jasne, czyste niebo bez mgły. +2-5 FPS.", "SKY_CLEAR", "sky_clear.xml", "timecycle_mod_1.xml", T_TIMECYCLE),
-    _step(G1, "sky-dark", "Ciemne nocne niebo", "Gwiazdy i głęboka czerń w nocy. Bez wpływu na FPS — czysta estetyka.", "SKY_DARK", "sky_dark.xml", "timecycle_mod_1.xml", T_TIMECYCLE),
-    _step(G1, "sun-soft", "Miękkie słońce (bez flary)", "Redukuje oślepiającą flarę i promienie. Lepszy komfort jazdy na wschód.", "SUN_SOFT", "sun_soft.xml", "timecycle_mod_2.xml", T_TIMECYCLE),
-    _step(G1, "clouds-off", "Usuń chmury", "Płaskie niebo bez chmur. +3-7 FPS (mniej alpha-blend warstw).", "CLOUDS_OFF", "clouds_off.rpf", "cloudhats.rpf", "mods/x64c.rpf/levels/gta5"),
-    # ---- GRUPA 2: WODA ----
-    _step(G2, "water-clear", "Przezroczysta woda", "Czysta woda bez zieleniny. ~0 FPS, lepszy look przy wybrzeżu.", "WATER_CLEAR", "water_clear.xml", "water.xml", T_WATER),
-    _step(G2, "water-fps", "Woda FPS boost", "Uproszczone fale i refleksy. +5-10 FPS nad wodą.", "WATER_FPS", "water_fps.xml", "water.xml", T_WATER),
-    _step(G2, "colors-vivid", "Nasycone kolory", "Żywsze barwy otoczenia. 0 FPS — tylko korekcja kolorów.", "COLORS_VIVID", "colors_vivid.xml", "timecycle_mod_3.xml", T_TIMECYCLE),
-    # ---- GRUPA 3: CIENIE ----
-    _step(G3, "shadows-total", "Cienie TOTAL OFF", "Zero cieni (najbardziej agresywne). +20-35 FPS na słabszych GPU.", "SHADOWS_TOTAL", "shadows_total.xml", "shaders.xml", T_DATA),
-    _step(G3, "shadows-partial", "Cienie PARTIAL (tylko postacie)", "Zostawia cienie postaci, usuwa resztę. +10-18 FPS, wygląda naturalnie.", "SHADOWS_PARTIAL", "shadows_partial.xml", "shaders.xml", T_DATA),
-    _step(G3, "postfx-clean", "PostFX czyste", "Usuwa bloom/blur/chromatic aberration. +3-8 FPS i czytelniejszy obraz.", "POSTFX_CLEAN", "postfx_clean.xml", "postfx.xml", T_DATA),
-    # ---- GRUPA 4: POJAZDY ----
-    _step(G4, "props-remove", "Usuń niepotrzebne propsy z mapy", "Krzaki, śmieci, pudła — +8-15 FPS w centrum miasta.", "PROPS_OFF", "props_remove.rpf", "props_remove.rpf", "mods/update/x64/dlcpacks"),
-    _step(G4, "windows-invisible", "Szyby niewidzialne", "Brak szyb w pojazdach (przezroczyste). +5-12 FPS przy dużym ruchu.", "WINDOWS_INVIS", "windows_invisible.ytd", "vehicle_shatter.ytd", "mods/x64e.rpf/models/cdimages/vehicles"),
-    _step(G4, "tire-smoke-off", "Usuń dym spod opon", "Zero tire smoke (drift/hamowanie). +3-6 FPS przy driftach.", "TIRE_SMOKE_OFF", "tire_smoke_off.rpf", "vehiclefx.rpf", "mods/x64e.rpf/graphics"),
-    _step(G4, "fire-sparks-off", "Usuń ogień i iskry", "Brak efektów ognia po wypadkach. +4-9 FPS w strzelaninach.", "FIRE_OFF", "fire_sparks_off.rpf", "vehicle_firefx.rpf", "mods/x64e.rpf/graphics"),
-    # ---- GRUPA 5: POTATO ----
-    _step(G5, "potato-full", "POTATO FULL (cała mapa plastelina)", "Tekstury budynków/terenu na low-poly. +25-50 FPS. Skiny broni i postaci zostają HD!", "POTATO_FULL", "potato_full.rpf", "potato_full.rpf", T_MODS),
-    _step(G5, "potato-terrain", "POTATO tylko teren (trawa, krzaki, ulice)", "Uproszczenie natury i dróg. +12-22 FPS. Budynki zostają normalne.", "POTATO_TERRAIN", "potato_terrain.rpf", "potato_terrain.rpf", T_MODS),
-    _step(G5, "grass-off", "Usuń trawę i krzaki", "Zero trawy (tylko ziemia/asfalt). +6-14 FPS w Los Santos.", "GRASS_OFF", "grass_off.rpf", "grass_off.rpf", T_MODS),
-    # ---- GRUPA 6: KOMBAT ----
-    _step(G6, "sound-bass", "Dźwięki broni bass boost", "Głębsze, mocniejsze strzały. 0 FPS — tylko audio.", "SOUND_BASS", "sound_bass.rpf", "weapon_sounds_bass.rpf", T_MODS),
-    _step(G6, "sound-decibels", "Dźwięki cichsze (decybele down)", "Łagodniejsze dla uszu przy długich sesjach.", "SOUND_DECIBELS", "sound_decibels.rpf", "weapon_sounds_soft.rpf", T_MODS),
-    _step(G6, "blood-anime", "Krew ANIME (kaskada)", "Efektowne tryskanie krwi jak w anime. Koszt FPS: ~2.", "BLOOD_ANIME", "blood_anime.dat", "bloodfx.dat", T_EFFECTS),
-    _step(G6, "blood-minimal", "Krew mała kropka (minimal)", "Ledwie widoczna kropka. +1-3 FPS przy strzelaninach.", "BLOOD_MINIMAL", "blood_minimal.dat", "bloodfx.dat", T_EFFECTS),
-    _step(G6, "blood-none", "Brak krwi", "Zero efektów krwi. +2-5 FPS i czystszy ekran.", "BLOOD_NONE", "blood_none.dat", "bloodfx.dat", T_EFFECTS),
-    _step(G6, "hitmarker-custom", "Hitmarkery custom", "Wyraźne, kolorowe hitmarkery przy trafieniu. 0 FPS.", "HITMARKER", "hitmarkers.rpf", "hitmarkers.rpf", T_MODS),
-    _step(G6, "crosshair-custom", "Crosshair custom", "Zmieniony celownik (kropka/krzyżyk, wybrany kolor).", "CROSSHAIR", "crosshair.rpf", "crosshair.rpf", T_MODS),
-]
+# ============================================================================
+# 2. DANE: KREATOR CITIZENA — PLIKI GENEROWANE (przeskany czysty citizen)
+#    Zamiast martwych placeholderów example.com bot SAM BUDUJE pliki paczki
+#    (timecycle/sggd.xml, weather.xml, time.xml, visualsettings.dat, bloodfx.dat)
+#    — dokładnie te same pliki co w citizen/common/data, tylko ze zmienionymi
+#    wartościami. Definicje kroków + custom nieba są w citizen_gen.py.
+# ============================================================================
+
+CITIZEN_STEPS: List[Dict[str, Any]] = CITIZEN_GENERATED_STEPS
+
 
 # ============================================================================
 # 3. DANE: SKINY BRONI (.ytd/.ydr)
@@ -312,41 +307,39 @@ def _skin(sid: str, name: str, desc: str, image: str, url: str, file_name: str,
     }
 
 
-# UWAGA: lista celowo OGRANICZONA do 4 broni (życzenie użytkownika):
-#   pistol / pistolmk2 / vintagepistol / snspistol.
-#   Wszystkie są w kategorii "pistols" — resztę kategorii i broni usunięto.
-WEAPON_CATEGORIES: List[Dict[str, Any]] = [
-    {
-        "id": "pistols",
-        "name": "🔫 Pistolety",
-        "weapons": [
-            {"id": "pistol", "name": "Pistol", "skins": [
-                _skin("pistol-blackops", "Black Ops", "Matowa czerń + zielone akcenty.", "PISTOL_BLACKOPS", "pistol_blackops.ytd", "w_pi_pistol.ytd"),
-                _skin("pistol-desert", "Desert Tan", "Pustynny kamuflaż.", "PISTOL_DESERT", "pistol_desert.ytd", "w_pi_pistol.ytd"),
-                _skin("pistol-gold", "Gold Luxury", "Złote wykończenie z czarnymi wstawkami.", "PISTOL_GOLD", "pistol_gold.ytd", "w_pi_pistol.ytd"),
-                _skin("pistol-neon", "Neon Rift", "Neonowe akcenty świecące w ciemności.", "PISTOL_NEON", "pistol_neon.ytd", "w_pi_pistol.ytd"),
-                _skin("pistol-jungle", "Jungle Camo", "Zielony kamuflaż dżungla.", "PISTOL_JUNGLE", "pistol_jungle.ytd", "w_pi_pistol.ytd"),
-                _skin("pistol-bloodline", "Bloodline", "Czarno-czerwone cięcia.", "PISTOL_BLOOD", "pistol_bloodline.ytd", "w_pi_pistol.ytd"),
-            ]},
-            {"id": "pistolmk2", "name": "Pistol Mk II", "skins": [
-                _skin("pistolmk2-camo", "Splinter Camo", "Kamuflaż łupany (splinter).", "MK2_CAMO", "pistolmk2_camo.ytd", "w_pi_pistolmk2.ytd"),
-                _skin("pistolmk2-gold", "Gold Bullion", "Sztabka złota na zamku.", "MK2_GOLD", "pistolmk2_gold.ytd", "w_pi_pistolmk2.ytd"),
-            ]},
-            {"id": "vintagepistol", "name": "Vintage Pistol", "skins": [
-                _skin("vintagepistol-gold", "Gold", "Złoty vintage.", "VINTAGE_GOLD", "vintagepistol_gold.ytd", "w_pi_vintage_pistol.ytd"),
-                _skin("vintagepistol-black", "Bakelite", "Czarny bakelit z lat 50.", "VINTAGE_BLACK", "vintagepistol_black.ytd", "w_pi_vintage_pistol.ytd"),
-            ]},
-            {"id": "snspistol", "name": "SNS Pistol", "skins": [
-                _skin("snspistol-gold", "Gold", "Złoty kieszonkowiec.", "SNS_GOLD", "snspistol_gold.ytd", "w_pi_sns_pistol.ytd"),
-                _skin("snspistol-chrome", "Chrome", "Chrom z białym chwytem.", "SNS_CHROME", "snspistol_chrome.ytd", "w_pi_sns_pistol.ytd"),
-            ]},
-            {"id": "snspistolmk2", "name": "SNS Pistol Mk II", "skins": [
-                _skin("snspistolmk2-tiger", "Tiger", "Tygrysi kamuflaż na czerni.", "SNSMK2_TIGER", "snspistolmk2_tiger.ytd", "w_pi_sns_pistolmk2.ytd"),
-                _skin("snspistolmk2-royal", "Royal", "Królewski fiolet ze złotem.", "SNSMK2_ROYAL", "snspistolmk2_royal.ytd", "w_pi_sns_pistolmk2.ytd"),
-            ]},
-        ],
-    },
-]
+# UWAGA: lista celowo OGRANICZONA do 4+1 broni (życzenie użytkownika):
+#   pistol / pistolmk2 / vintagepistol / snspistol / snspistolmk2.
+# Każda broń ma 25 skinów z EXPANDERA (Gold, Chrome, Neon, Galaxy...) = 125 skinów.
+
+
+def _expanded_weapon_categories() -> List[Dict[str, Any]]:
+    """Buduje katalog broni ze skinami z citizen_expand (25 skinów na broń)."""
+    try:
+        from citizen_expand import expanded_skins
+        expanded = expanded_skins()
+    except ImportError:  # pragma: no cover
+        expanded = {}
+    weapons = [
+        ("pistol", "Pistol", "w_pi_pistol.ytd"),
+        ("pistolmk2", "Pistol Mk II", "w_pi_pistolmk2.ytd"),
+        ("vintagepistol", "Vintage Pistol", "w_pi_vintage_pistol.ytd"),
+        ("snspistol", "SNS Pistol", "w_pi_sns_pistol.ytd"),
+        ("snspistolmk2", "SNS Pistol Mk II", "w_pi_sns_pistolmk2.ytd"),
+    ]
+    out_weapons: List[Dict[str, Any]] = []
+    for weapon_id, weapon_name, file_name in weapons:
+        skins = expanded.get(weapon_id) or []
+        out_weapons.append({
+            "id": weapon_id, "name": weapon_name,
+            "skins": [_skin(s["id"], s["name"], s["description"], s["image_name"],
+                            file_name.replace(".ytd", "") + "_" + s["name"].lower() + ".ytd",
+                            file_name)
+                      for s in skins],
+        })
+    return [{"id": "pistols", "name": "🔫 Pistolety", "weapons": out_weapons}]
+
+
+WEAPON_CATEGORIES: List[Dict[str, Any]] = _expanded_weapon_categories()
 
 # ============================================================================
 # 4. DANE: LIVE YOUTUBE FEED
@@ -542,9 +535,25 @@ def hashes_to_text(hashes: Sequence[Dict[str, Any]], build_name: str = "", user_
 
 conf_log = log("Conflicts")
 
+# Pary (gen_file, slot) — kroki dzielące ten sam plik, ale NIE kolidujące:
+# każdy slot to osobny "pokrętło" tego samego pliku (np. blood = baza,
+# kill = efekt zabicia, head = efekt headshota — łączą się w jeden bloodfx.dat).
+_COMPOSABLE_SLOTS = {"kill_style", "head_style"}
+
+
+def _gen_slot(item: Dict[str, str]) -> str:
+    """Który "pokrętło" pliku ustawia ten krok (dla kroków komponowalnych)."""
+    params = item.get("gen_params") or {}
+    for slot in _COMPOSABLE_SLOTS:
+        if slot in params:
+            return f"{item.get('gen_file')}#{slot}"
+    return str(item.get("gen_file") or "")
+
 
 def file_key(item: Dict[str, str]) -> str:
-    """Ścieżka docelowa pliku w paczce."""
+    """Ścieżka docelowa pliku w paczce (dla plików generowanych: citizen/...)."""
+    if item.get("generated"):
+        return f"citizen/common/data/{_gen_slot(item) or 'plik'}"
     target = (item.get("target") or "mods").strip("/")
     return f"{target}/{item.get('file_name') or 'plik'}"
 
@@ -887,7 +896,7 @@ def skin_image(weapon: Dict[str, Any], skin: Dict[str, Any]) -> bytes:
 
 def image_bytes_for(key: str) -> Optional[bytes]:
     """PNG po kluczu (`step-...` / `skin-...`) — dla endpointu /img/."""
-    clean = _safe_key(key).replace(".png", "")
+    clean = _safe_key(str(key).replace(".png", ""))  # .png zdejmujemy PRZED czyszczeniem
     if clean in _IMAGE_CACHE:
         return _IMAGE_CACHE[clean]
     if clean.startswith("step-"):
@@ -1514,8 +1523,9 @@ class Session:
         self.last_activity = time.time()
 
     def chosen_steps(self) -> List[Dict[str, str]]:
-        """Wybrane kroki citizena w kolejności wyboru."""
-        return [step for step in CITIZEN_STEPS if step["id"] in self.choices]
+        """Wybrane kroki citizena W KOLEJNOŚCI WYBORU (nie katalogu)."""
+        by_id = {step["id"]: step for step in CITIZEN_STEPS}
+        return [by_id[cid] for cid in self.choices if cid in by_id]
 
     def collect_skins(self) -> List[Dict[str, Any]]:
         """Wybrane skiny broni: z bazy + z wyszukiwarki .rpf."""
@@ -2826,6 +2836,51 @@ async def process_items(workspace: Path, items: Sequence[Dict[str, str]],
             dest = workspace / item["target"] / file_name
             dest.parent.mkdir(parents=True, exist_ok=True)
 
+            # 0) Plik GENEROWANY przez bota (citizen: te same pliki, zmienione wartości).
+            #   Ścieżka docelowa to pełna relatywna ścieżka w citizen/ — dlatego tu nadpisujemy dest.
+            if item.get("generated"):
+                gen_rel = str(item.get("gen_file") or "")
+                content = await asyncio.to_thread(generate_citizen_file, gen_rel, item.get("gen_params") or {})
+                if content is None:
+                    fp_log.error("Brak generatora dla %s (krok %s) — pomijam", gen_rel, item.get("id"))
+                    if session is not None:
+                        session.fatal_skipped.append(f"{item.get('name') or gen_rel} (brak generatora)")
+                    continue
+                dest = workspace / "citizen" / "common" / "data" / gen_rel
+                # Kroki KOMPOZYCYJNE (kill/head effect + blood) piszą do tego samego
+                # pliku — każdy w osobnym przebiegu, więc plik jest nadpisywany.
+                # Rozwiązanie: merge parametrów z pliku merge-state w workspace.
+                merge_state_path = workspace / ".gen_merge.json"
+                merge_state: Dict[str, Any] = {}
+                if merge_state_path.exists():
+                    try:
+                        merge_state = json.loads(merge_state_path.read_text(encoding="utf-8"))
+                    except Exception:  # noqa: BLE001
+                        merge_state = {}
+                key = str(dest.relative_to(workspace / "citizen" / "common" / "data").as_posix())
+                merged_params = dict(merge_state.get(key) or {})
+                merged_params.update(item.get("gen_params") or {})
+                merge_state[key] = merged_params
+                merge_state_path.write_text(json.dumps(merge_state), encoding="utf-8")
+                # Generuj ponownie z PEŁNYM zestawem parametrów (krew + kill + head razem)
+                content = await asyncio.to_thread(generate_citizen_file, gen_rel, merged_params)
+                if content is None:
+                    fp_log.error("Brak generatora dla %s (krok %s) — pomijam", gen_rel, item.get("id"))
+                    if session is not None:
+                        session.fatal_skipped.append(f"{item.get('name') or gen_rel} (brak generatora)")
+                    continue
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                await asyncio.to_thread(dest.write_text, content, encoding="utf-8", newline="\r\n")
+                digest, size = sha256_file(dest)
+                rel = dest.relative_to(workspace).as_posix()
+                # Dodaj hash tylko raz (przy ostatnim kroku danego pliku hash jest finalny)
+                hashes = [h for h in hashes if h["path"] != rel]
+                hashes.append({"path": rel, "sha256": digest, "size": size})
+                fp_log.info("  ✓ [GEN] %s (%.1f KB, params: %s)", rel, size / 1024,
+                            ", ".join(f"{k}={v}" for k, v in merged_params.items()))
+                item["file_name"] = dest.name
+                continue
+
             # 1) Własny plik gracza (wgrany na kanał sesji) — kopiujemy lokalnie.
             local = str(item.get("local_path") or "")
             own_file = bool(local) and Path(local).is_file()
@@ -3861,7 +3916,7 @@ def step_embed(step: Dict[str, str], index: int, chosen: bool, level: int = 99) 
     return embed
 
 
-def step_view(index: int, chosen: bool, locked: bool = False, level: int = 0) -> discord.ui.View:
+def build_select_view(session: Session) -> discord.ui.View:
     """
     Widok kroku: TYLKO przyciski (żadnej rozwijanej listy ani przewijania).
 
@@ -3888,6 +3943,54 @@ def step_view(index: int, chosen: bool, locked: bool = False, level: int = 0) ->
     nav.append(btn(f"citizen_next:{index}", "▶ Dalej", discord.ButtonStyle.primary))
     tools = [
         btn("citizen_upload", "📎 Własny plik", discord.ButtonStyle.secondary),
+        btn("citizen_summary", "📋 Podsumowanie", discord.ButtonStyle.secondary),
+        btn("session_close", "🔒 Zamknij", discord.ButtonStyle.danger),
+    ]
+    return LayoutView([first], nav, tools)
+
+
+def web_creator_link(user_id: int, kind: str = "citizen") -> str:
+    """
+    Adres kreatora WWW dla gracza (przekierowanie z Discorda na stronę).
+    """
+    return f"{PUBLIC_URL}/create/{kind}?user={user_id}"
+
+
+def web_link_button(user_id: int, kind: str = "citizen") -> discord.ui.Button:
+    """Przycisk-link „🌐 Otwórz w przeglądarce” — prowadzi do kreatora WWW."""
+    return discord.ui.Button(label="🌐 Otwórz w przeglądarce (duże zdjęcia)",
+                             url=web_creator_link(user_id, kind), row=4)
+
+
+def step_view(index: int, chosen: bool, locked: bool = False, level: int = 0,
+              user_id: int = 0) -> discord.ui.View:
+    """
+    Widok kroku: TYLKO przyciski (żadnej rozwijanej listy ani przewijania).
+
+    Opcje pokazują się **jedna po drugiej** i bot pyta o każdą z osobna:\n
+
+    1. ➕ Dodaj do paczki / ✅ Dodano (kliknięcie zabiera lub przywraca),\n
+    2. ◀ Wstecz / ⏭ Pomiń i dalej / ▶ Dalej — przejście do kolejnej opcji,\n
+    3. 🌐 Otwórz w przeglądarce — ten sam krok na ładnej stronie WWW,\n    4. 📎 Własny plik, 📋 Podsumowanie, 🔒 Zamknij.
+
+    Dzięki temu gracz nie szuka niczego na liście — klika i leci dalej.
+    """
+    if locked:
+        first = btn(f"citizen_locked:{index}", f"🔒 Wymaga poziomu {level}",
+                    discord.ButtonStyle.secondary)
+    else:
+        first = btn(f"citizen_add:{index}",
+                    "✅ Dodano (kliknij, aby usunąć)" if chosen else "➕ Dodaj do paczki",
+                    discord.ButtonStyle.danger if chosen else discord.ButtonStyle.success,
+                    "✅" if chosen else "➕")
+    nav: List[discord.ui.Button] = []
+    if index > 0:
+        nav.append(btn(f"citizen_back:{index}", "◀ Wstecz", discord.ButtonStyle.secondary))
+    nav.append(btn(f"citizen_skip:{index}", "⏭ Pomiń i dalej", discord.ButtonStyle.secondary))
+    nav.append(btn(f"citizen_next:{index}", "▶ Dalej", discord.ButtonStyle.primary))
+    tools = [
+        btn("citizen_upload", "📎 Własny plik", discord.ButtonStyle.secondary),
+        web_link_button(user_id, "citizen"),
         btn("citizen_summary", "📋 Podsumowanie", discord.ButtonStyle.secondary),
         btn("session_close", "🔒 Zamknij", discord.ButtonStyle.danger),
     ]
@@ -3937,7 +4040,14 @@ def citizen_summary_embed(session: Session) -> Tuple[discord.Embed, List[Dict[st
     lines: List[str] = []
     if kept:
         lines.append(f"🎨 **Presety citizena ({len(kept)}):**")
-        lines += [f"✅ **{s['name']}** — {s['description']}" for s in kept]
+        # Przy dużej liczbie opcji (katalog 100+) pokazujemy tylko pierwszych 20
+        # nazw — reszta jest w kreatorze WWW; embed ma limit 4096 znaków.
+        show_desc = len(kept) <= 20
+        visible = kept if show_desc else kept[:20]
+        lines += [f"✅ **{s['name']}**" + (f" — {s['description']}" if show_desc else "")
+                  for s in visible]
+        if len(kept) > 20:
+            lines.append(f"…oraz {len(kept) - 20} więcej (pełna lista w paczce)")
     if skins:
         lines.append("")
         lines.append(f"🔫 **Skiny broni ({len(skins)}):**")
@@ -3957,11 +4067,21 @@ def citizen_summary_embed(session: Session) -> Tuple[discord.Embed, List[Dict[st
                      f"(presety: {len(kept)}, skiny: {len(skins)}, własne pliki: {len(uploads)})")
     if dropped:
         lines += ["", "⚠️ **Wykryto konflikty plików** — zainstalowany zostanie **ostatnio wybrany** wariant:"]
-        lines += [f"• `{c['file']}` → **{c['winner']}** (pominięto: {', '.join(c['dropped'])})"
-                  for c in conflicts]
+        # Przy wielu konfliktach skracamy wiersz (limit 4096 znaków na embed)
+        max_conf = 12 if len(kept) > 40 else 25
+        max_dropped = 5 if len(kept) > 40 else 8
+        lines += [f"• `{c['file']}` → **{c['winner']}** (pominięto: {', '.join(c['dropped'][:max_dropped])}"
+                  + (f" …+{len(c['dropped']) - max_dropped}" if len(c['dropped']) > max_dropped else "") + ")"
+                  for c in conflicts[:max_conf]]
+        if len(conflicts) > max_conf:
+            lines.append(f"• …i {len(conflicts) - max_conf} innych konfliktów (ostatni wybór wygrywa)")
     lines += ["", f"🎮 **Docelowy build GTA V:** {build['name']}"]
+    # Twarda granica Discorda: 4096 znaków na opis embeda.
+    desc = "\n".join(lines)
+    if len(desc) > 4096:
+        desc = desc[:4020].rsplit("\n", 1)[0] + "\n…(skrócono — pełna lista jest w wygenerowanej paczce)"
     embed = discord.Embed(title="📋 Podsumowanie Twojej paczki Citizen",
-                          description="\n".join(lines), color=C_YELLOW)
+                          description=desc, color=C_YELLOW)
     embed.set_footer(text="📦 Zbuduj paczkę = ZIP • 📎 = Twój własny plik • ◀ Wróć = kolejne opcje")
     return embed, conflicts
 
@@ -4247,7 +4367,7 @@ async def send_step(channel: discord.abc.Messageable, session: Session, index: i
     locked = level < min_level_of(step)
     await send_with_image(channel, key=step_image_key(step), data=step_image(step),
                           embed=step_embed(step, index, chosen, level),
-                          view=step_view(index, chosen, locked, min_level_of(step)))
+                          view=step_view(index, chosen, locked, min_level_of(step), session.user_id))
 
 
 async def send_summary(channel: discord.abc.Messageable, session: Session) -> None:
@@ -4353,6 +4473,9 @@ def skin_view(weapon: Dict[str, Any], skin_index: int, session: Session) -> disc
     if page_buttons:
         rows.append(page_buttons)
     rows.extend(skin_nav_row())
+    # Discord limit: 5 rzędów (0-4) — web link doklejamy tylko gdy jest wolny rząd.
+    if len(rows) < 5:
+        rows.append([web_link_button(session.user_id, "skins")])
     return LayoutView(*rows)
 
 
@@ -5429,8 +5552,191 @@ async def http_preview(request: web.Request) -> web.Response:
 async def http_root(request: web.Request) -> web.Response:
     """GET / — informacja."""
     return web.Response(text=("FiveM Mod Foundry — bot działa.\n"
-                             "/health • /download/<token> • /preview/<token>\n"
+                             "/health • /download/<token> • /preview/<token> • /create\n"
                              "/api/pack/<token> • /api/profile/<discord_id> • /api/stats"))
+
+
+# ============================================================================
+# KREATOR WWW — strony /create/... (citizen i skiny, 1 opcja na ekran)
+# ============================================================================
+
+web_log = log("WebCreator")
+
+
+def _citizen_img_url(step: Dict[str, Any]) -> str:
+    """Duży podgląd kroku na stronie (endpoint /img/...)."""
+    return f"/img/{step_image_key(step)}.png"
+
+
+def _skin_img_url(weapon: Dict[str, Any], skin: Dict[str, Any]) -> str:
+    return f"/img/{skin_image_key(weapon, skin)}.png"
+
+
+async def http_create_home(request: web.Request) -> web.Response:
+    """GET /create — start kreatora (wybór: citizen albo skiny)."""
+    user_id = request.query.get("user", "anon")
+    return web.Response(text=render_home_page(user_id), content_type="text/html")
+
+
+async def http_create_citizen(request: web.Request) -> web.Response:
+    """GET /create/citizen?user=ID — nowa sesja kreatora citizena."""
+    user_id = request.query.get("user", "anon")
+    token = web_session_create("citizen", user_id)
+    raise web.HTTPFound(f"/create/citizen/{token}/page")
+
+
+async def http_create_skins(request: web.Request) -> web.Response:
+    """GET /create/skins?user=ID — nowa sesja kreatora skinów."""
+    user_id = request.query.get("user", "anon")
+    token = web_session_create("skins", user_id)
+    raise web.HTTPFound(f"/create/skins/{token}/page")
+
+
+async def _web_session_or_404(request: web.Request) -> Optional[Dict[str, Any]]:
+    token = request.match_info["token"]
+    sess = web_session_get(token)
+    if not sess:
+        return None
+    return sess
+
+
+def _expired_page() -> web.Response:
+    return web.Response(
+        text="<meta charset='utf-8'><body style='font-family:sans-serif;background:#0b0d13;"
+             "color:#e8ecf7;display:grid;place-items:center;height:100vh'>"
+             "<div style='text-align:center'><h1>⌛ Sesja wygasła</h1>"
+             "<p>Wróć do bota na Discordzie i kliknij przycisk ponownie.</p></div>",
+        content_type="text/html", status=410)
+
+
+async def http_citizen_page(request: web.Request) -> web.Response:
+    """GET /create/citizen/{token}/page — aktualny krok citizena."""
+    sess = await _web_session_or_404(request)
+    if not sess:
+        return _expired_page()
+    return web.Response(text=render_citizen_page(
+        request.match_info["token"], sess, CITIZEN_STEPS, _citizen_img_url),
+        content_type="text/html")
+
+
+async def http_citizen_action(request: web.Request) -> web.Response:
+    """GET /create/citizen/{token}/pick|skip|back/{index} — akcja gracza."""
+    sess = await _web_session_or_404(request)
+    if not sess:
+        return _expired_page()
+    action = request.match_info["action"]
+    index = int(request.match_info["index"])
+    steps = CITIZEN_STEPS
+    if action == "pick" and 0 <= index < len(steps):
+        sid = steps[index]["id"]
+        if sid not in sess["citizen_ids"]:
+            sess["citizen_ids"].append(sid)
+    elif action == "back" and index > 0:
+        # cofamy ostatni wybór (niezależnie od indexu — wracamy o jeden krok)
+        if sess["citizen_ids"]:
+            sess["citizen_ids"].pop()
+        if len(sess["citizen_ids"]) < index - 1:
+            pass
+    raise web.HTTPFound(f"/create/citizen/{request.match_info['token']}/page")
+
+
+async def http_skins_page(request: web.Request) -> web.Response:
+    """GET /create/skins/{token}/page — aktualny skin na ekranie."""
+    sess = await _web_session_or_404(request)
+    if not sess:
+        return _expired_page()
+    return web.Response(text=render_skins_page(
+        request.match_info["token"], sess, all_weapons(), _skin_img_url),
+        content_type="text/html")
+
+
+async def http_skins_action(request: web.Request) -> web.Response:
+    """GET /create/skins/{token}/pick|skip|back|weapon/..."""
+    sess = await _web_session_or_404(request)
+    if not sess:
+        return _expired_page()
+    action = request.match_info["action"]
+    value = request.match_info.get("value") or request.match_info.get("index", "")
+    if action == "weapon" and value:
+        sess["weapon"] = value
+    elif action == "pick":
+        weapon = next((w for w in all_weapons() if w["id"] == sess["weapon"]), None)
+        if weapon:
+            idx = int(value)
+            if 0 <= idx < len(weapon["skins"]):
+                sid = weapon["skins"][idx]["id"]
+                if sid not in sess["skin_ids"]:
+                    sess["skin_ids"].append(sid)
+    elif action == "back":
+        if sess["skin_ids"]:
+            sess["skin_ids"].pop()
+    raise web.HTTPFound(f"/create/skins/{request.match_info['token']}/page")
+
+
+async def http_create_finish(request: web.Request) -> web.Response:
+    """
+    GET /create/finish/{token} — buduje paczkę z wyborów z kreatora WWW.
+    Zwraca stronę z linkiem /download/<token> + (przy oknie bota) wrzuca na Discord.
+    """
+    sess = await _web_session_or_404(request)
+    if not sess:
+        return _expired_page()
+
+    # Budowa paczki w połowie synchronicznie (to endpoint HTTP — krótkie operacje OK)
+    workspace = WORKSPACES_DIR / f"web-{sess['user_id']}-{int(time.time())}"
+    workspace.mkdir(parents=True, exist_ok=True)
+    kind = sess["kind"]
+    try:
+        if kind == "citizen":
+            items = [dict(s) for s in CITIZEN_STEPS if s["id"] in sess["citizen_ids"]]
+            items, _dropped, _conflicts = resolve_conflicts(items)
+            kind_for_pack = "citizen"
+        else:
+            items = []
+            for weapon in WEAPON_CATEGORIES:
+                for skin in weapon["skins"]:
+                    if skin["id"] in sess["skin_ids"]:
+                        items.append({**skin, "name": f"{weapon['name']} — {skin['name']}"})
+            kind_for_pack = "weapons"
+        hashes = await process_items(workspace, items, None)
+        if not hashes:
+            return web.Response(text="<meta charset='utf-8'><body style='font-family:sans-serif;"
+                                     "background:#0b0d13;color:#ed4245;display:grid;place-items:center;"
+                                     "height:100vh'><h1>Brak plików do paczki — wybierz coś 🙂</h1>",
+                                content_type="text/html")
+        zip_name = f"paczka-{kind}-{int(time.time())}.zip"
+        zip_path = workspace.parent / zip_name
+        await asyncio.to_thread(zip_directory, workspace, zip_path)
+        size = zip_path.stat().st_size
+        file_count = count_files(workspace)
+        token = STORAGE.register(zip_path, zip_name, size, file_count,
+                                int(sess["user_id"]) if sess["user_id"].isdigit() else 0,
+                                workspace)
+        public = public_download_url(token)
+        download_url = public if public else f"/download/{token}"  # localhost: link względny
+    except Exception as exc:  # noqa: BLE001
+        await notify_error("Kreator WWW: błąd budowy paczki", str(exc), exc, "web_finish")
+        return web.Response(text="<meta charset='utf-8'><body style='font-family:sans-serif;"
+                                 "background:#0b0d13;color:#ed4245;display:grid;place-items:center;"
+                                 "height:100vh'><h1>Coś się posypało — spróbuj ponownie.</h1>",
+                            content_type="text/html", status=500)
+
+    main = f"""
+<div class="done-panel">
+  <div class="big">✅</div>
+  <h2>Paczka gotowa!</h2>
+  <p>ZIP zawiera tylko pliki z Twoich wyborów (hasze SHA-256 w HASHES.txt).</p>
+  <div class="actions" style="justify-content:center">
+    <a class="btn btn-primary" href="{html.escape(download_url)}">⬇️ Pobierz paczkę</a>
+    <a class="btn btn-ghost" href="/create">🏗️ Następna paczka</a>
+  </div>
+</div>"""
+    return web.Response(text=_page_html("Paczka gotowa", "zbudowano", main), content_type="text/html")
+
+
+def _page_html(title: str, chip: str, main_html: str) -> str:
+    """Dostęp do _page z web_creator (render końcowy)."""
+    return web_creator._page(title, chip, main_html)
 
 
 async def http_api_pack(request: web.Request) -> web.Response:
@@ -5543,6 +5849,14 @@ def create_http_app() -> web.Application:
     app.router.add_get("/download/{token}", http_download)
     app.router.add_get("/preview/{token}", http_preview)
     app.router.add_get("/img/{key}", http_image)
+    app.router.add_get("/create", http_create_home)
+    app.router.add_get("/create/citizen", http_create_citizen)
+    app.router.add_get("/create/citizen/{token}/page", http_citizen_page)
+    app.router.add_get("/create/citizen/{token}/{action}/{index}", http_citizen_action)
+    app.router.add_get("/create/skins", http_create_skins)
+    app.router.add_get("/create/skins/{token}/page", http_skins_page)
+    app.router.add_get("/create/skins/{token}/{action}/{value}", http_skins_action)
+    app.router.add_get("/create/finish/{token}", http_create_finish)
     app.router.add_get("/api/pack/{token}", http_api_pack)
     app.router.add_get("/api/profile/{user_id}", http_api_profile)
     app.router.add_get("/api/bridge/inbox", http_api_bridge_inbox)
@@ -6116,7 +6430,7 @@ class FoundryBot(discord.Client):
                 chosen = step["id"] in session.choices
                 await edit_with_image(interaction, key=step_image_key(step), data=step_image(step),
                                       embed=step_embed(step, index, chosen, level),
-                                      view=step_view(index, chosen, False))
+                                      view=step_view(index, chosen, False, 0, session.user_id))
                 return
 
             if custom_id.startswith("citizen_skip:"):
