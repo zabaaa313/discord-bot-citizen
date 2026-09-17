@@ -20,9 +20,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import html
+import io
 import json
 import logging
 import os
@@ -33,6 +35,7 @@ import sys
 import time
 import traceback
 import zipfile
+import zlib
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from logging.handlers import RotatingFileHandler
@@ -60,6 +63,12 @@ PUBLIC_URL = (os.getenv("PUBLIC_URL") or f"http://localhost:{HTTP_PORT}").rstrip
 SKIN_INDEX_URL = os.getenv("SKIN_INDEX_URL", "").strip()
 
 YT_SCAN_MINUTES = int(os.getenv("YT_SCAN_MINUTES", "15") or 15)
+# Skaner bierze filmy z ostatnich YT_MAX_AGE_DAYS dni (domyślnie 2 tygodnie).
+YT_MAX_AGE_DAYS = max(1, int(os.getenv("YT_MAX_AGE_DAYS", "14") or 14))
+# Ile zapytań na jeden skan (rotacja) — chroni darmowy limit YouTube API.
+YT_QUERIES_PER_RUN = max(4, int(os.getenv("YT_QUERIES_PER_RUN", "10") or 10))
+# Pauza skanera po wyczerpaniu limitu YouTube API.
+YT_QUOTA_BACKOFF_MINUTES = max(0, int(os.getenv("YT_QUOTA_BACKOFF_MINUTES", "60") or 60))
 ZIP_QUEUE_CONCURRENCY = int(os.getenv("ZIP_QUEUE_CONCURRENCY", "2") or 2)
 DOWNLOAD_TTL_MINUTES = int(os.getenv("DOWNLOAD_TTL_MINUTES", "60") or 60)
 SESSION_TTL_MINUTES = int(os.getenv("SESSION_TTL_MINUTES", "120") or 120)
@@ -83,6 +92,9 @@ QUEUE_NOTIFY = os.getenv("QUEUE_NOTIFY", "1").strip().lower() not in ("0", "fals
 SKINS_PER_PAGE = max(5, int(os.getenv("SKINS_PER_PAGE", "24") or 24))
 SEARCH_RESULTS_PER_PAGE = max(3, int(os.getenv("SEARCH_RESULTS_PER_PAGE", "8") or 8))
 STEPS_PER_PAGE = max(5, int(os.getenv("STEPS_PER_PAGE", "24") or 24))
+# --- Własne pliki graczy (przycisk 📎) — bez hostingu, prosto z Discorda ---
+UPLOAD_MAX_MB = max(1, int(os.getenv("UPLOAD_MAX_MB", "25") or 25))
+UPLOAD_MAX_FILES = max(1, int(os.getenv("UPLOAD_MAX_FILES", "20") or 20))
 
 ROOT = Path(__file__).parent.resolve()
 DOWNLOADS_DIR = ROOT / "downloads"
@@ -116,6 +128,12 @@ CH_DOWNLOADS = "centrum-pobierania"
 CH_HELP = "pomoc"
 CH_SYSLOG = "logi-system"
 
+# --- Kanały tematyczne live feedu (kategoria CAT_MODS) ---
+#   Każdy film z YouTube trafia na kanał pasujący do jego kategorii.
+CH_FEED_MODS = "mody-opti"          # mody klienckie: opti/potato/fpv/mapy/auta/grafika
+CH_FEED_SKINS = "skiny-rpf"         # skin packi i tekstury .rpf do broni
+CH_FEED_PC = "opti-kompa"           # optymalizacja komputera pod FiveM (Windows/GPU/ping)
+
 # --- Kolory embedow ---
 C_BLUE = 0x5865F2
 C_GREEN = 0x57F287
@@ -138,8 +156,13 @@ GAME_BUILDS: List[Dict[str, str]] = [
 #    Zdjęcia i linki do plików to PLACEHOLDERY — PODMIEŃ na własne!
 # ============================================================================
 
-IMG_BASE = "https://i.imgur.com/"          # <-- PODMIEŃ na swoje zdjęcia
-FILE_BASE = "https://example.com/presets/"  # <-- PODMIEŃ na swoje pliki modów
+# IMG_BASE: zostaw puste, a bot wygeneruje własne podglądy (PNG, zawsze działają).
+# Jeśli masz własne zdjęcia, ustaw np. IMG_BASE=https://twoj-host.pl/img/
+IMG_BASE = os.getenv("IMG_BASE", "").strip()
+if IMG_BASE and not IMG_BASE.endswith("/"):
+    IMG_BASE += "/"
+# FILE_BASE: skąd bot bierze pliki presetów (puste = tylko własne pliki graczy)
+FILE_BASE = os.getenv("FILE_BASE", "").strip()
 
 G1 = "1️⃣ ŚRODOWISKO — Niebo i timecycle"
 G2 = "2️⃣ WODA — czysta / FPS boost"
@@ -164,8 +187,13 @@ def _step(group: str, sid: str, name: str, desc: str, image: str,
         "id": sid,
         "name": name,
         "description": desc,
-        "image": f"{IMG_BASE}{image}.jpeg",
-        "file_url": f"{FILE_BASE}{url}",
+        # Puste = obrazek generuje bot (zawsze działa). Własne zdjęcie ustawisz
+        # w ENV IMG_BASE (wtedy budowane jest z nazwy w polu `image_name`).
+        "image": f"{IMG_BASE}{image}.jpeg" if IMG_BASE else "",
+        "image_name": image,
+        # Puste FILE_BASE = nie mamy hostingu presetów: krok jest opisany,
+        # a gracz wgrywa własny plik (przycisk 📎 Własny plik).
+        "file_url": f"{FILE_BASE}{url}" if FILE_BASE else "",
         "file_name": file_name,
         "target": target,
     }
@@ -208,18 +236,21 @@ CITIZEN_STEPS: List[Dict[str, str]] = [
 # 3. DANE: SKINY BRONI (.ytd/.ydr)
 # ============================================================================
 
-SKIN_BASE = "https://example.com/skins/"  # <-- PODMIEŃ na swoje pliki skinów
+# SKIN_BASE: hosting Twoich plików skinów (.ytd/.ydr). Puste = skiny z katalogu
+# są tylko opisami, a gracz wgrywa własny plik przyciskiem 📎 Własny skin.
+SKIN_BASE = os.getenv("SKIN_BASE", "").strip()
 
 
 def _skin(sid: str, name: str, desc: str, image: str, url: str, file_name: str,
           target: str = T_WEAPONS_TEX) -> Dict[str, str]:
-    """Buduje definicję jednego skina broni."""
+    """Buduje definicję jednego skina broni (grafika generowana, chyba że IMG_BASE)."""
     return {
         "id": sid,
         "name": name,
         "description": desc,
-        "image": f"{IMG_BASE}{image}.jpeg",
-        "file_url": f"{SKIN_BASE}{url}",
+        "image": f"{IMG_BASE}{image}.jpeg" if IMG_BASE else "",
+        "image_name": image,
+        "file_url": f"{SKIN_BASE}{url}" if SKIN_BASE else "",
         "file_name": file_name,
         "target": target,
     }
@@ -233,12 +264,55 @@ WEAPON_CATEGORIES: List[Dict[str, Any]] = [
             {"id": "pistol", "name": "Pistol", "skins": [
                 _skin("pistol-blackops", "Black Ops", "Matowa czerń + zielone akcenty.", "PISTOL_BLACKOPS", "pistol_blackops.ytd", "w_pi_pistol.ytd"),
                 _skin("pistol-desert", "Desert Tan", "Pustynny kamuflaż.", "PISTOL_DESERT", "pistol_desert.ytd", "w_pi_pistol.ytd"),
+                _skin("pistol-gold", "Gold Luxury", "Złote wykończenie z czarnymi wstawkami.", "PISTOL_GOLD", "pistol_gold.ytd", "w_pi_pistol.ytd"),
+                _skin("pistol-neon", "Neon Rift", "Neonowe akcenty świecące w ciemności.", "PISTOL_NEON", "pistol_neon.ytd", "w_pi_pistol.ytd"),
+                _skin("pistol-jungle", "Jungle Camo", "Zielony kamuflaż dżungla.", "PISTOL_JUNGLE", "pistol_jungle.ytd", "w_pi_pistol.ytd"),
+                _skin("pistol-bloodline", "Bloodline", "Czarno-czerwone cięcia.", "PISTOL_BLOOD", "pistol_bloodline.ytd", "w_pi_pistol.ytd"),
+            ]},
+            {"id": "pistol50", "name": "Pistol .50", "skins": [
+                _skin("pistol50-gold", "Gold", "Pełny złoty szkielet.", "P50_GOLD", "pistol50_gold.ytd", "w_pi_pistol50.ytd"),
+                _skin("pistol50-chrome", "Chrome", "Chromowany połysk jak lustro.", "P50_CHROME", "pistol50_chrome.ytd", "w_pi_pistol50.ytd"),
+                _skin("pistol50-black", "Stealth Black", "Matowa czerń bez odbić.", "P50_BLACK", "pistol50_black.ytd", "w_pi_pistol50.ytd"),
             ]},
             {"id": "heavypistol", "name": "Heavy Pistol", "skins": [
                 _skin("heavypistol-chrome", "Chrome", "Chromowany połysk.", "HEAVY_CHROME", "heavypistol_chrome.ytd", "w_pi_histol.ytd"),
+                _skin("heavypistol-gold", "Gold", "Złote wykończenie z drewnianym chwytem.", "HEAVY_GOLD", "heavypistol_gold.ytd", "w_pi_histol.ytd"),
+                _skin("heavypistol-digital", "Digital Camo", "Pikselowy kamuflaż ACU.", "HEAVY_DIGI", "heavypistol_digital.ytd", "w_pi_histol.ytd"),
             ]},
             {"id": "appistol", "name": "AP Pistol", "skins": [
                 _skin("appistol-carbon", "Carbon Fiber", "Węglowy wzór.", "AP_CARBON", "appistol_carbon.ytd", "w_pi_ap_pistol.ytd"),
+                _skin("appistol-viper", "Viper", "Jadowita zieleń na czerni.", "AP_VIPER", "appistol_viper.ytd", "w_pi_ap_pistol.ytd"),
+                _skin("appistol-frost", "Frost", "Lodowy błękit z białym szronem.", "AP_FROST", "appistol_frost.ytd", "w_pi_ap_pistol.ytd"),
+            ]},
+            {"id": "combatpistol", "name": "Combat Pistol", "skins": [
+                _skin("combatpistol-tan", "Desert Tan", "Pustynny kamuflaż.", "COMBAT_TAN", "combatpistol_tan.ytd", "w_pi_combatpistol.ytd"),
+                _skin("combatpistol-black", "Night Ops", "Czerń + szare elementy taktyczne.", "COMBAT_BLACK", "combatpistol_black.ytd", "w_pi_combatpistol.ytd"),
+                _skin("combatpistol-miami", "Miami", "Różowo-błękitny neon z lat 80.", "COMBAT_MIAMI", "combatpistol_miami.ytd", "w_pi_combatpistol.ytd"),
+            ]},
+            {"id": "pistolmk2", "name": "Pistol Mk II", "skins": [
+                _skin("pistolmk2-camo", "Splinter Camo", "Kamuflaż łupany (splinter).", "MK2_CAMO", "pistolmk2_camo.ytd", "w_pi_pistolmk2.ytd"),
+                _skin("pistolmk2-gold", "Gold Bullion", "Sztabka złota na zamku.", "MK2_GOLD", "pistolmk2_gold.ytd", "w_pi_pistolmk2.ytd"),
+            ]},
+            {"id": "snspistol", "name": "SNS Pistol", "skins": [
+                _skin("snspistol-gold", "Gold", "Złoty kieszonkowiec.", "SNS_GOLD", "snspistol_gold.ytd", "w_pi_sns_pistol.ytd"),
+                _skin("snspistol-chrome", "Chrome", "Chrom z białym chwytem.", "SNS_CHROME", "snspistol_chrome.ytd", "w_pi_sns_pistol.ytd"),
+            ]},
+            {"id": "ceramicpistol", "name": "Ceramic Pistol", "skins": [
+                _skin("ceramicpistol-black", "Ceramic Black", "Matowa ceramika.", "CERAMIC_BLACK", "ceramicpistol_black.ytd", "w_pi_ceramic_pistol.ytd"),
+                _skin("ceramicpistol-gold", "Ceramic Gold", "Ceramika ze złotym szlakiem.", "CERAMIC_GOLD", "ceramicpistol_gold.ytd", "w_pi_ceramic_pistol.ytd"),
+            ]},
+            {"id": "rev_heavy", "name": "Heavy Revolver", "skins": [
+                _skin("rev_heavy-chrome", "Chrome", "Chromowany rewolwer.", "REV_CHROME", "rev_heavy_chrome.ytd", "w_pi_revolver.ytd"),
+                _skin("rev_heavy-gold", "Gold Rush", "Złoto z orzechem na chwycie.", "REV_GOLD", "rev_heavy_gold.ytd", "w_pi_revolver.ytd"),
+                _skin("rev_heavy-engraved", "Engraved", "Grawerowane ornamenty.", "REV_ENGRAVED", "rev_heavy_engraved.ytd", "w_pi_revolver.ytd"),
+            ]},
+            {"id": "navyrevolver", "name": "Navy Revolver", "skins": [
+                _skin("navyrevolver-gold", "Gold", "Złoty klasyk z epoki.", "NAVY_GOLD", "navyrevolver_gold.ytd", "w_pi_navyrevolver.ytd"),
+                _skin("navyrevolver-wood", "Dark Wood", "Ciemne drewno + stal.", "NAVY_WOOD", "navyrevolver_wood.ytd", "w_pi_navyrevolver.ytd"),
+            ]},
+            {"id": "vintagepistol", "name": "Vintage Pistol", "skins": [
+                _skin("vintagepistol-gold", "Gold", "Złoty vintage.", "VINTAGE_GOLD", "vintagepistol_gold.ytd", "w_pi_vintage_pistol.ytd"),
+                _skin("vintagepistol-black", "Bakelite", "Czarny bakelit z lat 50.", "VINTAGE_BLACK", "vintagepistol_black.ytd", "w_pi_vintage_pistol.ytd"),
             ]},
         ],
     },
@@ -248,9 +322,15 @@ WEAPON_CATEGORIES: List[Dict[str, Any]] = [
         "weapons": [
             {"id": "microsmg", "name": "Micro SMG", "skins": [
                 _skin("microsmg-redline", "Redline", "Czerwone paski na czerni.", "MICRO_REDLINE", "microsmg_redline.ytd", "w_sb_microsmg.ytd"),
+                _skin("microsmg-gold", "Gold", "Złota kompaktowa SMG.", "MICRO_GOLD", "microsmg_gold.ytd", "w_sb_microsmg.ytd"),
             ]},
             {"id": "smg", "name": "SMG", "skins": [
                 _skin("smg-woodland", "Woodland", "Leśny kamuflaż.", "SMG_WOODLAND", "smg_woodland.ytd", "w_sb_smg.ytd"),
+                _skin("smg-digital", "Digital", "Pikselowy kamuflaż.", "SMG_DIGITAL", "smg_digital.ytd", "w_sb_smg.ytd"),
+            ]},
+            {"id": "assaultsmg", "name": "Assault SMG", "skins": [
+                _skin("assaultsmg-white", "Arctic", "Biały arktyczny kamuflaż.", "ASMG_ARCTIC", "assaultsmg_arctic.ytd", "w_sb_assaultsmg.ytd"),
+                _skin("assaultsmg-purple", "Royal Purple", "Fiolet z chromem.", "ASMG_PURPLE", "assaultsmg_purple.ytd", "w_sb_assaultsmg.ytd"),
             ]},
         ],
     },
@@ -260,21 +340,39 @@ WEAPON_CATEGORIES: List[Dict[str, Any]] = [
         "weapons": [
             {"id": "carbine", "name": "Carbine Rifle", "skins": [
                 _skin("carbine-tan", "Desert Tan", "Pustynny kamuflaż.", "CARBINE_TAN", "carbine_tan.ytd", "w_ar_carbine.ytd"),
+                _skin("carbine-gold", "Gold", "Złoty karabin kolekcjonerski.", "CARBINE_GOLD", "carbine_gold.ytd", "w_ar_carbine.ytd"),
+                _skin("carbine-splinter", "Splinter", "Kamuflaż łupany.", "CARBINE_SPLINTER", "carbine_splinter.ytd", "w_ar_carbine.ytd"),
             ]},
             {"id": "ak47", "name": "AK-47 (Assault Rifle)", "skins": [
                 _skin("ak47-redline", "Redline", "Czerwone linie na czerni.", "AK_REDLINE", "ak47_redline.ytd", "w_ar_assaultrifle.ytd"),
+                _skin("ak47-gold", "Gold Dragon", "Złoty smok na korpusie.", "AK_GOLD", "ak47_gold.ytd", "w_ar_assaultrifle.ytd"),
+                _skin("ak47-relic", "Relic Wood", "Stare drewno, zużyta stal.", "AK_RELIC", "ak47_relic.ytd", "w_ar_assaultrifle.ytd"),
+            ]},
+            {"id": "specialcarbine", "name": "Special Carbine", "skins": [
+                _skin("specialcarbine-black", "Black Market", "Czerń z mosiądzem.", "SCARB_BLACK", "specialcarbine_black.ytd", "w_ar_specialcarbine.ytd"),
+                _skin("specialcarbine-neon", "Neon Grid", "Neonowa siatka na korpusie.", "SCARB_NEON", "specialcarbine_neon.ytd", "w_ar_specialcarbine.ytd"),
             ]},
         ],
     },
-    {
-        "id": "shotguns",
-        "name": "🦆 Strzelby",
-        "weapons": [
+    {"id": "shotguns", "name": "🦆 Strzelby", "weapons": [
             {"id": "pumpshotgun", "name": "Pump Shotgun", "skins": [
                 _skin("pump-gold", "Gold Edition", "Złote wykończenie.", "PUMP_GOLD", "pump_gold.ytd", "w_sg_pumpshotgun.ytd"),
+                _skin("pump-tactical", "Tactical", "Taktyczna czerń z latarką.", "PUMP_TACTICAL", "pump_tactical.ytd", "w_sg_pumpshotgun.ytd"),
             ]},
-        ],
-    },
+            {"id": "sawnoff", "name": "Sawed-Off Shotgun", "skins": [
+                _skin("sawnoff-rust", "Rust", "Zardzewiały złom.", "SAW_RUST", "sawnoff_rust.ytd", "w_sg_sawnoff.ytd"),
+                _skin("sawnoff-chrome", "Chrome", "Chrom z czarnym chwytem.", "SAW_CHROME", "sawnoff_chrome.ytd", "w_sg_sawnoff.ytd"),
+            ]},
+        ]},
+    {"id": "machineguns", "name": "🧨 Broń maszynowa", "weapons": [
+            {"id": "mg", "name": "MG", "skins": [
+                _skin("mg-desert", "Desert Storm", "Pustynny kamuflaż pustynna burza.", "MG_DESERT", "mg_desert.ytd", "w_mg_mg.ytd"),
+                _skin("mg-tiger", "Tiger", "Tygrysie pasy.", "MG_TIGER", "mg_tiger.ytd", "w_mg_mg.ytd"),
+            ]},
+            {"id": "combatmg", "name": "Combat MG", "skins": [
+                _skin("combatmg-black", "Blackout", "Całkowicie czarny.", "CMG_BLACK", "combatmg_black.ytd", "w_mg_combatmg.ytd"),
+            ]},
+        ]},
 ]
 
 # ============================================================================
@@ -282,8 +380,20 @@ WEAPON_CATEGORIES: List[Dict[str, Any]] = [
 # ============================================================================
 
 YT_QUERIES: List[str] = [
+    # --- optymalizacja komputera (opti kompa) ---
+    "FiveM opti kompa",
+    "optymalizacja komputera FiveM",
+    "FiveM optymalizacja ustawien",
+    "FiveM fps boost windows 11",
+    "FiveM boost fps nvidia",
+    "FiveM stutter fix",
+    "FiveM lag fix pc",
+    "FiveM ping boost",
+    "jak zwiekszyc fps w fivem",
+    # --- mody klienckie / opti packi ---
     "FiveM FPS boost",
     "FiveM optimization mod rpf",
+    "FiveM opti pack client side",
     "FiveM low end pc mods",
     "FiveM LagFix",
     "FiveM low poly citizen",
@@ -291,16 +401,27 @@ YT_QUERIES: List[str] = [
     "FiveM first person rpf",
     "FiveM potato graphics",
     "FiveM potato mod rpf",
-    "FiveM weapon skins",
-    "FiveM gun skins pack",
     "FiveM graphics mod rpf",
     "FiveM visual settings",
+    "FiveM client side mods",
+    # --- mapy i auta (client-side) ---
     "FiveM PvP map opti",
     "FiveM client side map",
     "FiveM car mods client side",
+    # --- skiny broni (.rpf) ---
+    "FiveM weapon skins",
+    "FiveM gun skins pack",
+    "FiveM skiny broni rpf",
+    "FiveM weapon texture pack rpf",
 ]
 
 YT_CATEGORIES: List[Tuple[str, Tuple[str, ...]]] = [
+    # OPTI KOMPA musi być PIERWSZE — inaczej "opti" z kategorii OPTI przechwyci
+    # tytuły o optymalizacji komputera i film trafi na zły kanał.
+    ("OPTI KOMPA", ("opti kompa", "optymalizacja komputera", "optymalizacja pc", "opti pc",
+                    "fps boost pc", "boost fps pc", "windows 11", "windows 10", "nvidia",
+                    "geforce", "amd software", "gpu", "cpu", "stutter", "ping boost",
+                    "latency", "ssd", "komputer", "ustawienia pc", "game boost")),
     ("POTATO", ("potato",)),
     ("FIRST PERSON", ("first person", "fpv", "first-person", "low poly citizen")),
     ("SKINY BRONI", ("skin", "weapon", "gun", "texture", "broni")),
@@ -573,6 +694,283 @@ ul{margin:6px 0 0 18px;padding:0;line-height:1.6;font-size:13px;color:var(--mute
 footer{color:var(--muted);font-size:12px;padding:22px;text-align:center}
 """
 
+# ============================================================================
+# 9.3. GENERATOR PODGLĄDÓW (PNG bez zewnętrznych bibliotek)
+#   Wcześniej zdjęcia szły z zewnętrznego hostingu i były martwe (placeholder),
+#   a Discord nie wyświetla SVG. Dlatego każdy krok kreatora i każdy skin ma
+#   obrazek generowany lokalnie ze swojej palety — zawsze działa offline.
+#   Ten sam PNG obsługuje: embed (attachment:// albo /img/...), stronę podglądu
+#   (data URI) i endpoint /img/<klucz>.png.
+# ============================================================================
+
+img_log = log("Podglady")
+PREVIEW_W, PREVIEW_H = 640, 360
+_IMAGE_CACHE: Dict[str, bytes] = {}
+
+# Palety kroków citizena: (niebo, ziemia, akcent) — pokazują efekt opcji.
+STEP_COLORS: Dict[str, Tuple[str, str, str]] = {
+    "sky-clear": ("3aa0ff", "7a9b3f", "ffffff"),
+    "sky-dark": ("0b1026", "141c2e", "ffd479"),
+    "sun-soft": ("6fa8dc", "8a9a5b", "ffe9b0"),
+    "clouds-off": ("3f7fd0", "86a04a", "dfefff"),
+    "water-clear": ("2f8bd0", "1f6fa8", "9fe3ff"),
+    "water-fps": ("3b7ec4", "255d90", "bfe8ff"),
+    "colors-vivid": ("ff9a3c", "3fa34d", "ffd166"),
+    "shadows-total": ("c8d8e8", "d9d2b8", "ffffff"),
+    "shadows-partial": ("8fa8c0", "9a9a7a", "e8e8e8"),
+    "postfx-clean": ("dfe9f5", "b9bfa3", "ffffff"),
+    "props-remove": ("9fd0ef", "b5b09a", "cfd6c4"),
+    "windows-invisible": ("8ab6e0", "9aa08a", "ffffff"),
+    "tire-smoke-off": ("b9c6d4", "8d8d84", "e2e2e2"),
+    "fire-sparks-off": ("c9d3dd", "8a8a80", "efe6d0"),
+    "potato-full": ("7fd0ff", "6ab04c", "ffd23f"),
+    "potato-terrain": ("8ad4ff", "7bbf55", "ffe066"),
+    "grass-off": ("9fd7f5", "a8a48f", "d9d3bd"),
+    "sound-bass": ("1b2233", "3a2a1a", "ff8c2b"),
+    "sound-decibels": ("232a38", "3a3a46", "ffd8a8"),
+    "blood-anime": ("2a0d14", "3a1220", "ff2e6a"),
+    "blood-minimal": ("3a1d22", "4a2a2e", "ff6b81"),
+    "blood-none": ("2c2c2e", "3a3a3c", "dcdcdc"),
+    "hitmarker-custom": ("20232c", "2c3038", "ff4d4d"),
+    "crosshair-custom": ("1d2027", "282c34", "7cff6b"),
+}
+
+# Palety skinów broni: (metal, akcent) — dobierane deterministycznie po id skina.
+SKIN_PALETTES: Tuple[Tuple[str, str], ...] = (
+    ("14161c", "39ff88"), ("1b1b1b", "ff2e4d"), ("232733", "33c6ff"),
+    ("2b2118", "d9a441"), ("101820", "ff6ad5"), ("1f1f1f", "f2f2f2"),
+    ("182028", "9dff4d"), ("241a12", "ff9d2e"), ("111418", "7c4dff"),
+    ("2a2a2a", "00e5c0"), ("1a2418", "a3ff12"), ("20141c", "ff4fa3"),
+    ("3b2f12", "ffd166"), ("0f1a24", "00b3ff"), ("2c1216", "ff8c42"),
+    ("1c1f14", "b8ff2e"), ("26202e", "c77dff"), ("152018", "66ffcc"),
+)
+
+# Warianty grafiki skina (0 = pas, 1 = kamuflaż, 2 = szachownica).
+SKIN_PATTERNS = 3
+
+
+def _rgb(value: str) -> Tuple[int, int, int]:
+    """Zamienia '#rrggbb' na krotkę RGB."""
+    text = str(value).lstrip("#")
+    if len(text) == 3:
+        text = "".join(char * 2 for char in text)
+    if len(text) != 6:
+        return (40, 44, 52)
+    try:
+        return (int(text[0:2], 16), int(text[2:4], 16), int(text[4:6], 16))
+    except ValueError:
+        return (40, 44, 52)
+
+
+def _mix(first: Tuple[int, int, int], second: Tuple[int, int, int],
+         ratio: float) -> Tuple[int, int, int]:
+    """Miesza dwa kolory (ratio 0 = pierwszy, 1 = drugi)."""
+    ratio = max(0.0, min(1.0, ratio))
+    return tuple(int(first[i] + (second[i] - first[i]) * ratio) for i in range(3))  # type: ignore[return-value]
+
+
+def png_encode(rows: Sequence[Sequence[Tuple[int, int, int]]]) -> bytes:
+    """Koduje piksele RGB do PNG (zlib + CRC) — bez Pillow, czysty stdlib."""
+    height = len(rows)
+    width = len(rows[0]) if height else 0
+    raw = bytearray()
+    for row in rows:
+        raw.append(0)  # filtr 0 = brak
+        for pixel in row:
+            raw.extend(pixel)
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return (len(data).to_bytes(4, "big") + kind + data
+                + zlib.crc32(kind + data).to_bytes(4, "big"))
+
+    header = (width.to_bytes(4, "big") + height.to_bytes(4, "big") + bytes([8, 2, 0, 0, 0]))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header)
+            + chunk(b"IDAT", zlib.compress(bytes(raw), 6)) + chunk(b"IEND", b""))
+
+
+def _rect(buf: List[List[Tuple[int, int, int]]], x0: int, y0: int, x1: int, y1: int,
+          color: Tuple[int, int, int]) -> None:
+    """Prostokąt (z przycięciem do obszaru obrazka)."""
+    height, width = len(buf), len(buf[0])
+    for y in range(max(0, y0), min(height, y1)):
+        row = buf[y]
+        for x in range(max(0, x0), min(width, x1)):
+            row[x] = color
+
+
+def _disc(buf: List[List[Tuple[int, int, int]]], cx: int, cy: int, radius: int,
+          color: Tuple[int, int, int]) -> None:
+    """Koło (słońce/księżyc na podglądzie)."""
+    height, width = len(buf), len(buf[0])
+    for y in range(max(0, cy - radius), min(height, cy + radius)):
+        for x in range(max(0, cx - radius), min(width, cx + radius)):
+            if (x - cx) ** 2 + (y - cy) ** 2 <= radius * radius:
+                buf[y][x] = color
+
+
+def scene_png(sky: str, ground: str, accent: str, horizon: float = 0.62) -> bytes:
+    """Krajobraz: gradient nieba, podłoga, budynki i słońce w kolorze akcentu."""
+    top, bottom, key = _rgb(sky), _rgb(ground), _rgb(accent)
+    buf = [[_rgb(sky) for _ in range(PREVIEW_W)] for _ in range(PREVIEW_H)]
+    line = int(PREVIEW_H * horizon)
+    for y in range(line):
+        _rect(buf, 0, y, PREVIEW_W, y + 1, _mix(top, _mix(top, bottom, 0.35), y / max(1, line)))
+    _rect(buf, 0, line, PREVIEW_W, PREVIEW_H, bottom)
+    _disc(buf, int(PREVIEW_W * 0.78), int(line * 0.34), 26, key)
+    # trzy budynki z oknami
+    for index, (bx, bw, bh) in enumerate(((70, 96, 150), (196, 74, 110), (300, 120, 190))):
+        building = _mix(bottom, (18, 18, 22), 0.45)
+        _rect(buf, bx, line - bh, bx + bw, line, building)
+        for wy in range(line - bh + 12, line - 12, 22):
+            for wx in range(bx + 10, bx + bw - 10, 24):
+                _rect(buf, wx, wy, wx + 12, wy + 10, key if (wx + wy + index) % 3 else _mix(key, building, 0.4))
+    # droga z przodu
+    _rect(buf, 0, line + int((PREVIEW_H - line) * 0.55), PREVIEW_W, PREVIEW_H, _mix(bottom, (10, 10, 12), 0.5))
+    return png_encode(buf)
+
+
+def weapon_png(metal: str, accent: str, pattern: int = 0) -> bytes:
+    """
+    Podgląd skina: sylwetka broni w kolorach skina (na ciemnym tle).
+
+    `pattern` daje 3 warianty grafiki, żeby każdy skin w galerii wyglądał inaczej:
+    pas (0), kamuflaż z plam (1) albo szachownica (2).
+    """
+    base, key = _rgb(metal), _rgb(accent)
+    background = _rgb("0e1116")
+    buf = [[background for _ in range(PREVIEW_W)] for _ in range(PREVIEW_H)]
+    for y in range(PREVIEW_H):
+        _rect(buf, 0, y, PREVIEW_W, y + 1, _mix(background, _rgb("1c2230"), y / PREVIEW_H))
+    dark = _mix(base, (0, 0, 0), 0.35)
+    light = _mix(base, (255, 255, 255), 0.18)
+    # korpus
+    _rect(buf, 150, 150, 470, 186, base)
+    _rect(buf, 150, 186, 470, 196, dark)
+    # lufa + tłumik
+    _rect(buf, 470, 158, 590, 178, base)
+    _rect(buf, 578, 152, 600, 184, dark)
+    # chwyt
+    for i in range(9):
+        _rect(buf, 196 + i * 3, 196 + i * 12, 236 + i * 3, 210 + i * 12, dark if i % 2 else base)
+    # magazynek + spust
+    _rect(buf, 300, 196, 344, 274, base)
+    _rect(buf, 306, 202, 338, 268, key)
+    _rect(buf, 250, 196, 268, 232, dark)
+    _rect(buf, 236, 224, 300, 234, dark)
+    # --- wzór skina ---
+    variant = pattern % SKIN_PATTERNS
+    if variant == 1:            # kamuflaż: plamy na korpusie i lufie
+        for i in range(8):
+            _disc(buf, 168 + i * 38, 166 + (i % 3) * 8, 9 + (i % 3), _mix(base, key, 0.55))
+            _disc(buf, 478 + (i % 4) * 28, 166 + (i % 2) * 6, 6, _mix(base, key, 0.4))
+    elif variant == 2:          # szachownica
+        for i in range(150, 470, 24):
+            for j in range(150, 196, 12):
+                if (i // 24 + j // 12) % 2:
+                    _rect(buf, i, j, i + 12, j + 12, _mix(base, key, 0.7))
+    else:                       # pas + podkreślenie
+        _rect(buf, 150, 166, 470, 174, key)
+        _rect(buf, 150, 176, 470, 179, light)
+    # muszka i szczerbinka
+    _rect(buf, 452, 142, 462, 152, dark)
+    _rect(buf, 176, 142, 186, 152, dark)
+    # kolba
+    _rect(buf, 60, 156, 150, 192, dark)
+    return png_encode(buf)
+
+
+def _safe_key(key: str) -> str:
+    """Bezpieczny klucz obrazka (tylko litery, cyfry i myślniki)."""
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "-", str(key)).strip("-").lower()
+    return cleaned[:60] or "podglad"
+
+
+def step_image_key(step: Dict[str, Any]) -> str:
+    return f"step-{_safe_key(step.get('id', 'krok'))}"
+
+
+def skin_image_key(weapon: Dict[str, Any], skin: Dict[str, Any]) -> str:
+    return f"skin-{_safe_key(skin.get('id', 'skin'))}"
+
+
+def step_image(step: Dict[str, Any]) -> bytes:
+    """PNG podglądu kroku citizena (cache w pamięci)."""
+    key = step_image_key(step)
+    if key not in _IMAGE_CACHE:
+        sky, ground, accent = STEP_COLORS.get(str(step.get("id")), ("4a9dff", "6f8f45", "ffd166"))
+        _IMAGE_CACHE[key] = scene_png(sky, ground, accent)
+    return _IMAGE_CACHE[key]
+
+
+def skin_image(weapon: Dict[str, Any], skin: Dict[str, Any]) -> bytes:
+    """PNG podglądu skina broni (paleta i wzór dobierane deterministycznie po id)."""
+    key = skin_image_key(weapon, skin)
+    if key not in _IMAGE_CACHE:
+        seed = zlib.crc32(str(skin.get("id", "")).encode())
+        metal, accent = SKIN_PALETTES[seed % len(SKIN_PALETTES)]
+        _IMAGE_CACHE[key] = weapon_png(metal, accent, (seed // len(SKIN_PALETTES)) % SKIN_PATTERNS)
+    return _IMAGE_CACHE[key]
+
+
+def image_bytes_for(key: str) -> Optional[bytes]:
+    """PNG po kluczu (`step-...` / `skin-...`) — dla endpointu /img/."""
+    clean = _safe_key(key).replace(".png", "")
+    if clean in _IMAGE_CACHE:
+        return _IMAGE_CACHE[clean]
+    if clean.startswith("step-"):
+        for step in CITIZEN_STEPS:
+            if step_image_key(step) == clean:
+                return step_image(step)
+    if clean.startswith("skin-"):
+        for weapon in all_weapons():
+            for skin in weapon["skins"]:
+                if skin_image_key(weapon, skin) == clean:
+                    return skin_image(weapon, skin)
+    return None
+
+
+def public_image_url(key: str) -> str:
+    """Adres obrazka na serwerze bota (PUBLIC_URL + /img)."""
+    return f"{PUBLIC_URL}/img/{_safe_key(key)}.png"
+
+
+def public_url_is_public() -> bool:
+    """Czy PUBLIC_URL wskazuje publiczny adres (a nie localhost)?"""
+    host = (urlparse(PUBLIC_URL).hostname or "").lower()
+    return bool(host) and host not in ("localhost", "127.0.0.1", "0.0.0.0", "::1")
+
+
+def embed_image_ref(key: str) -> str:
+    """URL do embeda: publiczny /img/... albo załącznik `attachment://`."""
+    if public_url_is_public():
+        return public_image_url(key)
+    return f"attachment://{_safe_key(key)}.png"
+
+
+def image_attachment(key: str, data: bytes) -> Optional[discord.File]:
+    """Załącznik z podglądem (tylko gdy nie mamy publicznego URL-a)."""
+    if public_url_is_public():
+        return None
+    return discord.File(io.BytesIO(data), filename=f"{_safe_key(key)}.png")
+
+
+def item_image_data_uri(item: Dict[str, Any]) -> str:
+    """Obrazek pozycji jako data URI (do strony podglądu, bez hostingu)."""
+    step_id = str(item.get("id") or "")
+    weapon_id = str(item.get("weapon_id") or "")
+    if weapon_id and step_id:
+        weapon = find_weapon(weapon_id)
+        if weapon:
+            for skin in weapon["skins"]:
+                if skin["id"] == step_id:
+                    data = skin_image(weapon, skin)
+                    return "data:image/png;base64," + base64.b64encode(data).decode("ascii")
+    for step in CITIZEN_STEPS:
+        if step["id"] == step_id:
+            data = step_image(step)
+            return "data:image/png;base64," + base64.b64encode(data).decode("ascii")
+    return ""
+
 
 def render_preview_html(items: Sequence[Dict[str, Any]], conflicts: Sequence[Dict[str, Any]] = (),
                         build: str = "", title: str = "Podgląd kombinacji") -> str:
@@ -580,7 +978,8 @@ def render_preview_html(items: Sequence[Dict[str, Any]], conflicts: Sequence[Dic
     cards = []
     for item in items:
         tag = f'<span class="tag">{html.escape(str(item.get("group") or ""))}</span>' if item.get("group") else ""
-        image = f'<img src="{html.escape(str(item.get("image") or ""))}" alt="podglad">' if item.get("image") else ""
+        source = str(item.get("image") or "") or item_image_data_uri(item)
+        image = f'<img src="{html.escape(source)}" alt="podglad">' if source else ""
         cards.append(
             f'<div class="card">{image}<div class="body">{tag}'
             f'<div class="name">{html.escape(str(item.get("name") or ""))}</div>'
@@ -990,6 +1389,12 @@ class Session:
         self.fatal_skipped: List[str] = []                  # pliki odrzucone jako crash-prone
         self.build_id = DEFAULT_BUILD_ID
         self.preview_token: Optional[str] = None
+        # Własne pliki gracza (przycisk 📎): plik wgrany na kanał sesji trafia
+        # do paczki bez żadnego hostingu — bot kopiuje go lokalnie.
+        self.uploads: List[Dict[str, Any]] = []
+        self.upload_armed = False               # czekamy na załącznik gracza
+        self.upload_target = "mods"             # gdzie zainstalować plik
+        self.upload_kind = "citizen"            # 'citizen' | 'weapons'
         self.created_at = time.time()
         self.last_activity = time.time()
         self.delivered_at: Optional[float] = None
@@ -1019,6 +1424,17 @@ class Session:
                 "target": skin.get("target") or "mods",
             })
         return out
+
+    def collect_uploads(self) -> List[Dict[str, Any]]:
+        """Własne pliki gracza w formacie pozycji paczki (kopiowane z dysku)."""
+        return [dict(upload) for upload in self.uploads]
+
+    def package_items(self, kind: str = "citizen") -> List[Dict[str, Any]]:
+        """Wszystko, co wchodzi do paczki: presety (citizen) + skiny + własne pliki."""
+        kept: List[Dict[str, Any]] = []
+        if kind == "citizen":
+            kept, _dropped, _conflicts = resolve_conflicts(self.chosen_steps())
+        return list(kept) + self.collect_skins() + self.collect_uploads()
 
 
 SESSIONS: Dict[int, Session] = {}
@@ -1644,6 +2060,7 @@ TAG_RULES: List[Tuple[str, Tuple[str, ...]]] = [
 
 CATEGORY_TAGS: Dict[str, Tuple[str, ...]] = {
     "OPTI": ("optymalizacja", "fps"),
+    "OPTI KOMPA": ("optymalizacja", "fps"),
     "POTATO": ("potato", "optymalizacja"),
     "FIRST PERSON": ("first person", "hud"),
     "SKINY BRONI": ("skiny-broni",),
@@ -2294,16 +2711,38 @@ async def process_items(workspace: Path, items: Sequence[Dict[str, str]],
     hashes: List[Dict[str, Any]] = []
     async with aiohttp.ClientSession(headers={"User-Agent": "FiveMModFoundry/3.0"}) as http:
         for item in items:
-            url = item["file_url"]
             file_name = resolve_file_name(item)
             dest = workspace / item["target"] / file_name
             dest.parent.mkdir(parents=True, exist_ok=True)
-            source = FILE_CACHE.lookup(url)
-            if source is not None:
-                fp_log.info("Cache HIT: %s -> %s", url, dest.relative_to(workspace))
+
+            # 1) Własny plik gracza (wgrany na kanał sesji) — kopiujemy lokalnie.
+            local = str(item.get("local_path") or "")
+            own_file = bool(local) and Path(local).is_file()
+            if own_file:
+                source = Path(local)
+                fp_log.info("Własny plik gracza: %s -> %s", source.name, dest.relative_to(workspace))
             else:
-                fp_log.info("Pobieram (raz, potem z cache): %s", url)
-                source = await fetch_to_cache(http, url)
+                url = str(item.get("file_url") or "")
+                if not url:
+                    # Presety bez hostingu: nic do pobrania — gracz wgra własny plik.
+                    fp_log.warning("  ⚠ %s pominięty — brak pliku źródłowego presetów.", file_name)
+                    if session is not None:
+                        session.fatal_skipped.append(f"{item.get('name') or file_name} (brak pliku — wgraj własny)")
+                    continue
+                source = FILE_CACHE.lookup(url)
+                if source is not None:
+                    fp_log.info("Cache HIT: %s -> %s", url, dest.relative_to(workspace))
+                else:
+                    fp_log.info("Pobieram (raz, potem z cache): %s", url)
+                    try:
+                        source = await fetch_to_cache(http, url)
+                    except Exception as exc:  # noqa: BLE001
+                        fp_log.warning("Nie pobrano %s: %s", url, exc)
+                        if session is not None:
+                            session.fatal_skipped.append(
+                                f"{item.get('name') or file_name} "
+                                "(nie pobrano z hostingu — wgraj własny plik przyciskiem 📎)")
+                        continue
             await asyncio.to_thread(shutil.copyfile, source, dest)
 
             # --- ANTY-CRASH: walidacja + auto-patch ---
@@ -2312,6 +2751,14 @@ async def process_items(workspace: Path, items: Sequence[Dict[str, str]],
             if fixes:
                 report["fixes"] = fixes
                 fp_log.info("  🔧 %s: %s", file_name, "; ".join(fixes))
+            if report["severity"] == "crash" and own_file:
+                # Własny plik gracza zawsze zostaje w paczce — gracz świadomie go wgrał.
+                # Zamiast cichego odrzucenia dostaje ostrzeżenie przy pliku w raporcie.
+                fp_log.warning("  ⚠ %s: własny plik gracza z ostrzeżeniem — %s",
+                               file_name, report["reason"])
+                report["severity"] = "warn"
+                report["reason"] = (f"własny plik gracza — zostawiony mimo ostrzeżenia "
+                                    f"walidatora: {report['reason']}")
             if report["severity"] == "crash":
                 fp_log.error("  ⛔ %s odrzucony: %s", file_name, report["reason"])
                 dest.unlink(missing_ok=True)
@@ -2795,12 +3242,105 @@ def classify_video(title: str) -> str:
     return "INNE"
 
 
+# ---------------------------------------------------------------------------
+# Rozdzielenie feedu na kanały tematyczne + rotacja zapytań
+# ---------------------------------------------------------------------------
+
+FEED_CHANNELS: Dict[str, str] = {
+    "OPTI KOMPA": CH_FEED_PC,
+    "SKINY BRONI": CH_FEED_SKINS,
+    "POTATO": CH_FEED_MODS,
+    "FIRST PERSON": CH_FEED_MODS,
+    "OPTI": CH_FEED_MODS,
+    "MAPY": CH_FEED_MODS,
+    "AUTA": CH_FEED_MODS,
+    "GRAFIKA": CH_FEED_MODS,
+    "INNE": CH_MODS_LIVE,
+}
+
+FEED_CHANNEL_TOPICS: Dict[str, str] = {
+    CH_FEED_MODS: "⚙️ Mody OPTI / FPS / potato / first person / mapy / auta z YouTube.",
+    CH_FEED_SKINS: "🔫 Skin packi i tekstury .rpf do broni — najnowsze z YouTube.",
+    CH_FEED_PC: "🖥️ Optymalizacja komputera pod FiveM: Windows, GPU, stutter, ping.",
+    CH_MODS_LIVE: "📡 Reszta modów klienckich + archiwum feedu.",
+}
+
+
+def feed_channel_for(category: str) -> str:
+    """Nazwa kanału, na który trafia film z danej kategorii."""
+    return FEED_CHANNELS.get(category, CH_FEED_MODS)
+
+
+def yt_recency_cutoff(days: Optional[int] = None) -> str:
+    """Data graniczna ISO dla YouTube (domyślnie YT_MAX_AGE_DAYS wstecz, czyli 2 tygodnie)."""
+    span = YT_MAX_AGE_DAYS if days is None else max(1, int(days))
+    return (datetime.now(timezone.utc) - timedelta(days=span)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def yt_published_ts(published: str) -> int:
+    """Timestamp publikacji filmu (0, gdy YouTube nie podał daty)."""
+    try:
+        return int(datetime.fromisoformat(str(published).replace("Z", "+00:00")).timestamp())
+    except (ValueError, TypeError):
+        return 0
+
+
+def days_ago(published: str) -> int:
+    """Ile dni temu opublikowano film (0 = dzisiaj / brak daty)."""
+    stamp = yt_published_ts(published)
+    if not stamp:
+        return 0
+    return max(0, int((time.time() - stamp) // 86400))
+
+
+# Rotacja zapytań: jedno zapytanie YouTube kosztuje 100 z 10 000 darmowych
+# jednostek na dobę, więc skanujemy porcjami — cały zestaw obraca się w kółko.
+_yt_query_cursor = {"value": 0}
+_yt_quota_block = {"until": 0.0, "count": 0}
+
+
+def next_query_batch(queries: Optional[Sequence[str]] = None) -> List[str]:
+    """Kolejna porcja zapytań do przeskanowania (rotacja)."""
+    pool = list(queries if queries is not None else YT_QUERIES)
+    if not pool:
+        return []
+    size = min(YT_QUERIES_PER_RUN, len(pool))
+    start = _yt_query_cursor["value"] % len(pool)
+    batch = [pool[(start + offset) % len(pool)] for offset in range(size)]
+    _yt_query_cursor["value"] = (start + size) % len(pool)
+    return batch
+
+
+def yt_quota_blocked() -> bool:
+    """True, gdy skaner odpoczywa po wyczerpaniu limitu YouTube API."""
+    return time.time() < _yt_quota_block["until"]
+
+
+def yt_quota_minutes_left() -> int:
+    """Ile minut zostało do końca pauzy po limicie (0 = brak pauzy)."""
+    left = _yt_quota_block["until"] - time.time()
+    return max(0, int(left // 60) + 1) if left > 0 else 0
+
+
+def yt_register_quota_error() -> int:
+    """Wstrzymuje skan na YT_QUOTA_BACKOFF_MINUTES i zwraca liczbę takich zdarzeń z rzędu."""
+    _yt_quota_block["count"] += 1
+    _yt_quota_block["until"] = time.time() + YT_QUOTA_BACKOFF_MINUTES * 60
+    return _yt_quota_block["count"]
+
+
+def yt_reset_quota_block() -> None:
+    """Zdejmuje pauzę (udany skan = limit znów działa)."""
+    _yt_quota_block["until"] = 0.0
+    _yt_quota_block["count"] = 0
+
+
 async def fetch_videos(http: aiohttp.ClientSession, query: str) -> List[Dict[str, Any]]:
-    """Pobiera najnowsze filmy dla jednego zapytania."""
-    published_after = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    """Pobiera najnowsze filmy dla jednego zapytania (z ostatnich YT_MAX_AGE_DAYS dni)."""
+    published_after = yt_recency_cutoff()
     params = {
         "key": YOUTUBE_API_KEY, "q": query, "part": "snippet", "type": "video",
-        "order": "date", "publishedAfter": published_after, "maxResults": "10",
+        "order": "date", "publishedAfter": published_after, "maxResults": "15",
         "relevanceLanguage": "pl",
     }
     async with http.get("https://www.googleapis.com/youtube/v3/search", params=params) as response:
@@ -2828,74 +3368,128 @@ async def fetch_videos(http: aiohttp.ClientSession, query: str) -> List[Dict[str
 
 
 async def scan_videos() -> List[Dict[str, Any]]:
-    """Skanuje YouTube i zwraca NOWE filmy z modami klienckimi."""
+    """
+    Skanuje YouTube i zwraca NOWE filmy z ostatnich YT_MAX_AGE_DAYS dni
+    (mody klienckie + skiny .rpf + optymalizacja komputera).
+
+    Każdy film dostaje kategorię i nazwę kanału, na który ma trafić, oraz
+    `days_ago` — sortujemy od najświeższych, żeby feed był aktualny.
+    """
     if not YOUTUBE_API_KEY:
         raise YouTubeQuotaError("Brak YOUTUBE_API_KEY w .env")
+    if yt_quota_blocked():
+        yt_log.info("Skan wstrzymany — limit YouTube API, jeszcze %s min.", yt_quota_minutes_left())
+        return []
 
+    queries = next_query_batch()
+    yt_log.info("Skan YouTube: %s zapytan (ostatnie %s dni).", len(queries), YT_MAX_AGE_DAYS)
     posted = _load_posted()
     candidates: List[Dict[str, Any]] = []
+    quota_error = False
     async with aiohttp.ClientSession() as http:
-        for query in YT_QUERIES:
+        for query in queries:
             try:
                 for video in await fetch_videos(http, query):
                     if video["id"] in posted or not passes_filter(video["title"], video["channel"]):
                         continue
                     video["category"] = classify_video(video["title"])
+                    video["channel_name"] = feed_channel_for(video["category"])
+                    video["days_ago"] = days_ago(video.get("published", ""))
                     video["safe_links"] = safe_links_from_description(video["description"])
                     posted.add(video["id"])
                     candidates.append(video)
+            except YouTubeQuotaError as exc:
+                quota_error = True
+                yt_log.error('Limit YouTube przy "%s": %s', query, exc)
             except Exception as exc:  # noqa: BLE001
                 yt_log.error('Blad zapytania "%s": %s', query, exc)
             await asyncio.sleep(0.3)
+
+    if quota_error:
+        count = yt_register_quota_error()
+        yt_log.warning("Limit YouTube API wyczerpany (%s. raz) — pauza %s min.",
+                       count, YT_QUOTA_BACKOFF_MINUTES)
+    else:
+        yt_reset_quota_block()
 
     if not candidates:
         return []
 
     seen: set = set()
     unique = [v for v in candidates if not (v["id"] in seen or seen.add(v["id"]))]
-    unique.sort(key=lambda v: v["category"])
+    unique.sort(key=lambda v: (v.get("days_ago", 0), v["category"]))
     _save_posted(posted)
     return unique[:30]
 
 
 async def post_videos(bot: "FoundryBot", videos: Sequence[Dict[str, Any]]) -> int:
-    """Wrzuca filmy na kanał #mody-optymalizacja-live każdego serwera."""
+    """
+    Rozdziela filmy na kanały tematyczne każdego serwera:
+
+    • 🔫 #skiny-rpf — skin packi i tekstury .rpf do broni,
+    • ⚙️ #mody-opti — opti/potato/first person/mapy/auta/grafika,
+    • 🖥️ #opti-kompa — optymalizacja komputera (Windows, GPU, stutter, ping),
+    • 📡 #mody-optymalizacja-live — reszta i archiwum feedu.
+
+    Brakujące kanały bot tworzy sam.
+    """
     posted = 0
+    per_channel: Dict[str, int] = {}
     posted_titles: List[str] = []
     for guild in bot.guilds:
-        channel = find_channel(guild, CAT_MODS, CH_MODS_LIVE)
-        if not channel:
-            continue
+        category = discord.utils.get(guild.categories, name=CAT_MODS)
+        if category is None:
+            try:
+                category = await ensure_category(guild, CAT_MODS)
+            except discord.HTTPException as exc:
+                yt_log.warning("Nie utworzono kategorii %s na %s: %s", CAT_MODS, guild.name, exc)
+                continue
         for video in videos:
+            channel_name = str(video.get("channel_name")
+                               or feed_channel_for(str(video.get("category"))))
+            channel = find_channel(guild, CAT_MODS, channel_name)
+            if channel is None:
+                try:
+                    channel = await ensure_text_channel(
+                        guild, category, channel_name, FEED_CHANNEL_TOPICS.get(channel_name, ""))
+                except discord.HTTPException as exc:
+                    yt_log.warning("Nie utworzono kanalu #%s na %s: %s", channel_name, guild.name, exc)
+                    continue
+
             links = video.get("safe_links") or []
             links_text = ("\n**🔗 Linki z opisu:**\n" + "\n".join(
                 f"- [{link['host']}]({link['url']})" for link in links[:3])) if links else \
                 "\n*Brak zweryfikowanych linków w opisie — sprawdź sam w filmie.*"
+            published_ts = yt_published_ts(video.get("published", ""))
             embed = discord.Embed(
                 title=f"🎬 [{video['category']}] {video['title'][:230]}",
                 url=f"https://www.youtube.com/watch?v={video['id']}",
                 description=(
-                    f"**Kategoria:** `{video['category']}`\n"
-                    f"**Kanał:** {video['channel']}\n"
-                    f"**Opublikowano:** <t:{int(datetime.fromisoformat(video['published'].replace('Z', '+00:00')).timestamp())}:R>"
-                    f"{links_text}\n\n⚠️ Sprawdź regulamin serwera, na którym grasz!"
+                    f"**Kategoria:** `{video['category']}` • **kanał docelowy:** #{channel_name}\n"
+                    f"**Autor:** {video['channel']}\n"
+                    f"**Opublikowano:** <t:{published_ts}:R>"
+                    + (f" (świeże — {video['days_ago']} dni temu)" if video.get("days_ago") else "")
+                    + f"{links_text}\n\n⚠️ Sprawdź regulamin serwera, na którym grasz!"
                 ),
                 color=C_ORANGE, timestamp=datetime.now(timezone.utc),
             )
             embed.set_thumbnail(url=video["thumbnail"])
-            embed.set_footer(text="Live Mod Feed • tylko mody klienckie (client-side)")
+            embed.set_footer(text=f"Live Mod Feed • ostatnie {YT_MAX_AGE_DAYS} dni • "
+                                  "tylko mody klienckie (client-side)")
             try:
                 await channel.send(embed=embed)
                 posted += 1
+                per_channel[channel_name] = per_channel.get(channel_name, 0) + 1
                 posted_titles.append(str(video.get("title"))[:80])
             except discord.HTTPException as exc:
-                yt_log.warning("Nie wyslano na %s: %s", guild.name, exc)
+                yt_log.warning("Nie wyslano na #%s (%s): %s", channel_name, guild.name, exc)
     if posted:
+        summary = ", ".join(f"#{name}: {count}" for name, count in sorted(per_channel.items()))
+        yt_log.info("Feed: %s filmow (%s).", posted, summary)
         await bridge_notify(
             "🎬 Nowe mody w feedzie",
-            f"Wrzucono {posted} nowych filmów z modami klienckimi: "
-            + "; ".join(posted_titles[:3]),
-            kind="mods", meta={"count": posted})
+            f"Wrzucono {posted} filmów ({summary}): " + "; ".join(posted_titles[:3]),
+            kind="mods", meta={"count": posted, "channels": per_channel})
     return posted
 
 
@@ -2910,8 +3504,12 @@ async def run_scan(bot: "FoundryBot", interaction: Optional[discord.Interaction]
             yt_log.info("Smart pingi: %s spersonalizowanych rekomendacji na priv.", pings)
         if interaction:
             await interaction.followup.send(
-                f"✅ Skan zakończony — wrzucono **{count}** nowych filmów"
-                + (f", wysłano **{pings}** spersonalizowanych rekomendacji." if pings else "."))
+                f"✅ Skan zakończony — wrzucono **{count}** nowych filmów "
+                f"(z ostatnich **{YT_MAX_AGE_DAYS} dni**) na kanały "
+                f"#{CH_FEED_SKINS}, #{CH_FEED_MODS} i #{CH_FEED_PC}"
+                + (f", wysłano **{pings}** spersonalizowanych rekomendacji." if pings else ".")
+                + (f"\n⏳ Limit YouTube API — kolejny skan za ~{yt_quota_minutes_left()} min."
+                   if yt_quota_blocked() else ""))
     except Exception as exc:  # noqa: BLE001
         yt_log.error("Blad skanera: %s", exc)
         if interaction:
@@ -3116,30 +3714,44 @@ def step_embed(step: Dict[str, str], index: int, chosen: bool, level: int = 99) 
         description=description,
         color=C_YELLOW if locked else (C_GREEN if chosen else C_BLUE),
     )
-    embed.set_image(url=step["image"])
+    embed.set_image(url=embed_image_ref(step_image_key(step)))
     embed.set_footer(text=(
         "🔒 Preset ekskluzywny — zbuduj więcej paczek, aby odblokować" if locked
-        else "Zdjęcie poglądowe efektu w grze • FiveM Mod Foundry"))
+        else "Podgląd generowany przez bota • własny plik dodasz przyciskiem 📎"))
     return embed
 
 
 def step_view(index: int, chosen: bool, locked: bool = False, level: int = 0) -> discord.ui.View:
-    """Widok kroku: rząd przycisków + OSOBNY rząd select (Discord tego wymaga!)."""
+    """
+    Widok kroku: TYLKO przyciski (żadnej rozwijanej listy ani przewijania).
+
+    Opcje pokazują się **jedna po drugiej** i bot pyta o każdą z osobna:
+
+    1. ➕ Dodaj do paczki / ✅ Dodano (kliknięcie zabiera lub przywraca),\n
+    2. ◀ Wstecz / ⏭ Pomiń i dalej / ▶ Dalej — przejście do kolejnej opcji,\n
+    3. 📎 Własny plik, 📋 Podsumowanie, 🔒 Zamknij.
+
+    Dzięki temu gracz nie szuka niczego na liście — klika i leci dalej.
+    """
     if locked:
         first = btn(f"citizen_locked:{index}", f"🔒 Wymaga poziomu {level}",
                     discord.ButtonStyle.secondary)
     else:
         first = btn(f"citizen_add:{index}",
-                    "Dodano ✓ (kliknij, aby usunąć)" if chosen else "Dodaj do paczki",
-                    discord.ButtonStyle.success if chosen else discord.ButtonStyle.primary,
+                    "✅ Dodano (kliknij, aby usunąć)" if chosen else "➕ Dodaj do paczki",
+                    discord.ButtonStyle.danger if chosen else discord.ButtonStyle.success,
                     "✅" if chosen else "➕")
-    buttons = [
-        first,
-        btn(f"citizen_skip:{index}", "Pomiń", discord.ButtonStyle.secondary, "⏭️"),
-        btn("citizen_summary", "Podsumowanie", discord.ButtonStyle.secondary, "📋"),
+    nav: List[discord.ui.Button] = []
+    if index > 0:
+        nav.append(btn(f"citizen_back:{index}", "◀ Wstecz", discord.ButtonStyle.secondary))
+    nav.append(btn(f"citizen_skip:{index}", "⏭ Pomiń i dalej", discord.ButtonStyle.secondary))
+    nav.append(btn(f"citizen_next:{index}", "▶ Dalej", discord.ButtonStyle.primary))
+    tools = [
+        btn("citizen_upload", "📎 Własny plik", discord.ButtonStyle.secondary),
+        btn("citizen_summary", "📋 Podsumowanie", discord.ButtonStyle.secondary),
+        btn("session_close", "🔒 Zamknij", discord.ButtonStyle.danger),
     ]
-    jump = select(f"citizen_jump:{index}", "Przeskocz do innego kroku...", step_jump_options(index))
-    return LayoutView(buttons, [jump])
+    return LayoutView([first], nav, tools)
 
 
 def build_select_view(session: Session) -> discord.ui.View:
@@ -3175,11 +3787,34 @@ def ticket_view(session: Session, with_mode: bool = True) -> discord.ui.View:
 
 
 def citizen_summary_embed(session: Session) -> Tuple[discord.Embed, List[Dict[str, Any]]]:
-    """Embed podsumowania citizena (+ konflikty)."""
+    """Embed podsumowania citizena (presety + skiny broni + własne pliki + konflikty)."""
     kept, dropped, conflicts = resolve_conflicts(session.chosen_steps())
+    skins = session.collect_skins()
+    uploads = session.collect_uploads()
     build = build_by_id(session.build_id)
-    lines = [f"✅ **{s['name']}** — {s['description']}" for s in kept] or [
-        "*Nie wybrano nic — wróć do kroków przyciskami powyżej.*"]
+    total = len(kept) + len(skins) + len(uploads)
+
+    lines: List[str] = []
+    if kept:
+        lines.append(f"🎨 **Presety citizena ({len(kept)}):**")
+        lines += [f"✅ **{s['name']}** — {s['description']}" for s in kept]
+    if skins:
+        lines.append("")
+        lines.append(f"🔫 **Skiny broni ({len(skins)}):**")
+        lines += [f"✅ **{s['name']}** — {s.get('description') or ''}" for s in skins[:15]]
+    if uploads:
+        lines.append("")
+        lines.append(f"📎 **Własne pliki ({len(uploads)}):**")
+        lines += [f"• `{u['name']}` ({u.get('size', 0) / 1024:.0f} KB) → `{u['target']}`"
+                  for u in uploads[:15]]
+    if not total:
+        lines = ["*Nie wybrano jeszcze nic.*",
+                 "⬅️ Dodawaj opcje przyciskami **➕ Dodaj do paczki** / **⏭ Pomiń** "
+                 "(pokazują się jedna po drugiej), a swój plik wrzucisz przyciskiem **📎 Własny plik**."]
+    else:
+        lines.append("")
+        lines.append(f"📦 **Pozycji w paczce:** {total} "
+                     f"(presety: {len(kept)}, skiny: {len(skins)}, własne pliki: {len(uploads)})")
     if dropped:
         lines += ["", "⚠️ **Wykryto konflikty plików** — zainstalowany zostanie **ostatnio wybrany** wariant:"]
         lines += [f"• `{c['file']}` → **{c['winner']}** (pominięto: {', '.join(c['dropped'])})"
@@ -3187,16 +3822,16 @@ def citizen_summary_embed(session: Session) -> Tuple[discord.Embed, List[Dict[st
     lines += ["", f"🎮 **Docelowy build GTA V:** {build['name']}"]
     embed = discord.Embed(title="📋 Podsumowanie Twojej paczki Citizen",
                           description="\n".join(lines), color=C_YELLOW)
-    embed.set_footer(text="Kliknij „Zakończ tworzenie', aby zbudować ZIP.")
+    embed.set_footer(text="📦 Zbuduj paczkę = ZIP • 📎 = Twój własny plik • ◀ Wróć = kolejne opcje")
     return embed, conflicts
 
 
 def publish_citizen_preview(session: Session, conflicts: Sequence[Dict[str, Any]]) -> Optional[str]:
-    """Generuje podgląd kombinacji citizena (Live Before/After) i zwraca link."""
-    kept, _dropped, _conflicts = resolve_conflicts(session.chosen_steps())
-    if not kept:
+    """Generuje podgląd całej paczki citizena (presety + skiny + własne pliki)."""
+    items = session.package_items("citizen")
+    if not items:
         return None
-    page = render_preview_html(kept, conflicts, build_by_id(session.build_id)["name"], "Podgląd citizena")
+    page = render_preview_html(items, conflicts, build_by_id(session.build_id)["name"], "Podgląd citizena")
     session.preview_token = STORAGE.register_preview(page, "Podgląd citizena", session.user_id)
     return f"{PUBLIC_URL}/preview/{session.preview_token}"
 
@@ -3210,8 +3845,254 @@ def publish_skins_preview(session: Session, skins: Sequence[Dict[str, Any]]) -> 
     return f"{PUBLIC_URL}/preview/{session.preview_token}"
 
 # ============================================================================
+# 18b. WŁASNE PLIKI GRACZA (📎) — bez hostingu, prosto z Discorda
+# ============================================================================
+
+upload_log = log("Uploads")
+
+# (cel instalacji, etykieta przycisku)
+UPLOAD_TARGETS: Tuple[Tuple[str, str], ...] = (
+    (T_MODS, "📦 Mod / paczka (.rpf/.zip)"),
+    (T_WEAPONS_TEX, "🔫 Tekstura broni (.ytd/.ydr)"),
+    (T_DATA, "🧩 Ustawienia (.xml/.dat/.meta)"),
+    (T_EFFECTS, "🎬 Efekty (krew/iskry/ogień)"),
+    ("mods/update/x64/dlcpacks", "👕 Model postaci / pojazdu"),
+)
+
+UPLOAD_EXTENSIONS: Tuple[str, ...] = (
+    ".rpf", ".ytd", ".ydr", ".ydd", ".xml", ".dat", ".meta", ".zip", ".oiv",
+    ".asi", ".ini", ".png", ".jpg", ".jpeg", ".webp",
+)
+UPLOAD_IMAGE_EXT: Tuple[str, ...] = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+UPLOAD_UA = {"User-Agent": "FiveMModFoundry/3.0"}
+
+
+def upload_target_label(target: str) -> str:
+    """Ładna nazwa celu instalacji pliku."""
+    return dict(UPLOAD_TARGETS).get(target, target or T_MODS)
+
+
+def uploads_dir(session: Session) -> Path:
+    """Katalog na własne pliki gracza (w jego workspace)."""
+    path = session.workspace / "uploads"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def safe_upload_name(name: str) -> str:
+    """Bezpieczna nazwa pliku z załącznika (bez ścieżek i dziwnych znaków)."""
+    clean = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(str(name)).name).strip("._")
+    return (clean or "plik.bin")[:80]
+
+
+def upload_target_buttons() -> discord.ui.View:
+    """Przyciski wyboru celu instalacji (bez rozwijanych list — same przyciski)."""
+    rows: List[List[discord.ui.Button]] = []
+    current: List[discord.ui.Button] = []
+    for target, label in UPLOAD_TARGETS:
+        current.append(btn(f"upload_target:{target}", label, discord.ButtonStyle.secondary))
+        if len(current) == 3:
+            rows.append(current)
+            current = []
+    if current:
+        rows.append(current)
+    rows.append([btn("upload_cancel", "✖ Anuluj", discord.ButtonStyle.danger)])
+    return LayoutView(*rows)
+
+
+def upload_prompt_embed(session: Session, target: str = "") -> discord.Embed:
+    """Instrukcja: wybierz cel, potem wyślij plik jako załącznik (albo link)."""
+    formats = ".rpf .ytd .ydr .ydd .xml .dat .meta .zip .png .jpg"
+    if not target:
+        return discord.Embed(
+            title="📎 Własny plik — gdzie ma trafić?",
+            description=("Wybierz przyciskiem miejsce instalacji, a potem **wyślij plik jako "
+                         "załącznik na tym kanale** (możesz też wkleić sam link).\n\n"
+                         f"• Maksymalny rozmiar: **{UPLOAD_MAX_MB} MB** na plik\n"
+                         f"• Maksymalnie **{UPLOAD_MAX_FILES}** własnych plików w paczce\n"
+                         f"• Formaty: {formats}"),
+            color=C_PURPLE)
+    return discord.Embed(
+        title=f"📎 Wyślij plik — cel: {upload_target_label(target)}",
+        description=("**Wyślij plik jako załącznik na tym kanale** — bot pobierze go na swój dysk "
+                     "i włoży do Twojej paczki (nic nie musisz hostować).\n\n"
+                     f"📁 Cel instalacji: `{target}`\n"
+                     f"📏 Limit: **{UPLOAD_MAX_MB} MB** • formaty: {formats}\n\n"
+                     "Wklejenie linku do pliku (`https://...`) też zadziała.\n"
+                     "Nie chcesz? Kliknij **✖ Anuluj**."),
+        color=C_GREEN)
+
+
+def register_upload(session: Session, name: str, data: bytes, target: str,
+                    url: str = "") -> Optional[Dict[str, Any]]:
+    """Zapisuje własny plik gracza na dysk i zwraca pozycję paczki."""
+    try:
+        dest = uploads_dir(session) / name
+        dest.write_bytes(data)
+    except OSError as exc:
+        upload_log.error("Nie zapisano pliku %s: %s", name, exc)
+        return None
+    extension = Path(name).suffix.lower()
+    record: Dict[str, Any] = {
+        "id": f"upload-{len(session.uploads) + 1}",
+        "name": name,
+        "description": f"własny plik gracza — {upload_target_label(target)}",
+        "group": "📎 Własne pliki",
+        "target": target,
+        "local_path": str(dest),
+        "file_name": name,
+        "file_url": "",
+        "image": "",
+        "size": len(data),
+        "url": url,
+        "is_image": extension in UPLOAD_IMAGE_EXT,
+        "kind": session.upload_kind,
+    }
+    session.uploads.append(record)
+    upload_log.info("Upload user=%s %s -> %s (%.1f KB)",
+                    session.user_id, name, target, len(data) / 1024)
+    return record
+
+
+async def fetch_upload_link(session: Session, url: str, target: str) -> Optional[Dict[str, Any]]:
+    """Pobiera plik z linku wklejonego przez gracza i dodaje go do paczki."""
+    limit = UPLOAD_MAX_MB * 1024 * 1024
+    name = safe_upload_name(file_name_from_url(url) or "plik.bin")
+    if Path(name).suffix.lower() not in UPLOAD_EXTENSIONS:
+        return None
+    try:
+        async with aiohttp.ClientSession(headers=UPLOAD_UA) as http:
+            async with http.get(url, timeout=aiohttp.ClientTimeout(total=45)) as response:
+                if response.status != 200:
+                    return None
+                data = await response.content.read(limit + 1)
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        upload_log.warning("Nie pobrano pliku z linku %.60s: %s", url, exc)
+        return None
+    if not data or len(data) > limit:
+        return None
+    return register_upload(session, name, data, target, url)
+
+
+async def deliver_upload_report(channel: discord.abc.Messageable, session: Session,
+                               added: Sequence[Dict[str, Any]],
+                               rejected: Sequence[str]) -> None:
+    """Raport po wgraniu: co weszło do paczki, co odpadło + przyciski dalej."""
+    lines = ([f"✅ **Dodano do paczki ({len(added)}):**"]
+             + [f"• `{u['name']}` ({u.get('size', 0) / 1024:.1f} KB) → `{u['target']}`"
+                for u in added]) if added else ["⚠️ Nie dodano żadnego pliku."]
+    if rejected:
+        lines += ["", "❌ **Odrzucone:**"] + [f"• {item}" for item in rejected]
+    lines += ["", f"📎 Własnych plików w paczce: **{len(session.uploads)}**"]
+    embed = discord.Embed(title="📎 Własne pliki", description="\n".join(lines),
+                          color=C_GREEN if added else C_YELLOW)
+    image = next((u["url"] for u in reversed(list(added)) if u.get("is_image") and u.get("url")), "")
+    if image:
+        embed.set_image(url=image)
+    embed.set_footer(text="Wrzuć kolejny plik przyciskiem 📎 albo wróć do kreatora ▶")
+    rows: List[Any] = [[
+        btn("citizen_upload", "📎 Dodaj kolejny", discord.ButtonStyle.primary),
+        btn("upload_done", "▶ Wróć do kreatora", discord.ButtonStyle.success),
+    ], [
+        btn("citizen_summary", "📋 Podsumowanie", discord.ButtonStyle.secondary),
+        btn("session_close", "🔒 Zamknij", discord.ButtonStyle.danger),
+    ]]
+    try:
+        await channel.send(embed=embed, view=LayoutView(*rows))
+    except discord.HTTPException as exc:
+        sys_log.warning("Nie wyslano raportu wlasnych plikow: %s", exc)
+
+
+async def handle_upload_message(message: discord.Message, session: Session) -> bool:
+    """
+    Obsługuje własne pliki gracza (przycisk 📎): załączniki albo linki.
+
+    Zwraca True, gdy wiadomość była próbą wgrania pliku (i została obsłużona).
+    """
+    files = list(message.attachments)
+    links = [] if files else re.findall(r"https?://\S+", message.content or "")
+    if not files and not links:
+        return False
+    target = session.upload_target or T_MODS
+    session.upload_armed = False
+    added: List[Dict[str, Any]] = []
+    rejected: List[str] = []
+
+    for source in files:
+        name = safe_upload_name(source.filename)
+        extension = Path(name).suffix.lower()
+        if len(session.uploads) >= UPLOAD_MAX_FILES:
+            rejected.append(f"`{name}` — limit {UPLOAD_MAX_FILES} własnych plików w paczce")
+            continue
+        if extension not in UPLOAD_EXTENSIONS:
+            rejected.append(f"`{name}` — nieobsługiwany format ({extension or 'brak'})")
+            continue
+        data = await source.read()
+        if not data:
+            rejected.append(f"`{name}` — plik jest pusty")
+            continue
+        if len(data) > UPLOAD_MAX_MB * 1024 * 1024:
+            rejected.append(f"`{name}` — większy niż {UPLOAD_MAX_MB} MB")
+            continue
+        record = register_upload(session, name, data, target, source.url)
+        if record:
+            added.append(record)
+        else:
+            rejected.append(f"`{name}` — nie udało się zapisać na dysku")
+
+    for link in links[:3]:
+        record = await fetch_upload_link(session, link, target)
+        if record:
+            added.append(record)
+        else:
+            rejected.append(f"`{link[:70]}` — nie udało się pobrać (zły link, format lub rozmiar)")
+
+    try:
+        await message.delete()
+    except discord.HTTPException:
+        pass
+    await deliver_upload_report(message.channel, session, added, rejected)
+    return True
+
+
+# ============================================================================
 # 19. KREATOR CITIZENA — wysyłanie kroków
 # ============================================================================
+
+
+async def send_with_image(channel: discord.abc.Messageable, *, key: str, data: bytes,
+                          embed: discord.Embed, view: discord.ui.View,
+                          content: Optional[str] = None) -> None:
+    """Wysyła wiadomość z wygenerowanym podglądem (załącznik, gdy brak PUBLIC_URL)."""
+    file = image_attachment(key, data)
+    try:
+        if file is None:
+            await channel.send(content=content, embed=embed, view=view)
+        else:
+            await channel.send(content=content, embed=embed, view=view, file=file)
+    except discord.HTTPException as exc:
+        sys_log.warning("Nie wyslano wiadomosci z podgladem (%s): %s", key, exc)
+
+
+async def edit_with_image(interaction: discord.Interaction, *, key: str, data: bytes,
+                          embed: discord.Embed, view: discord.ui.View) -> None:
+    """
+    Edytuje wiadomość z nowym podglądem.
+
+    Discord nie pozwala dopiąć pliku do edycji tak jak do nowej wiadomości,
+    dlatego próbujemy `attachments=[file]`, a gdy wersja biblioteki tego nie
+    wspiera — edytujemy sam embed (obrazek z /img/ nadal działa).
+    """
+    file = image_attachment(key, data)
+    if file is not None:
+        try:
+            await interaction.response.edit_message(embed=embed, view=view, attachments=[file])
+            return
+        except TypeError:
+            pass
+        except discord.HTTPException as exc:
+            sys_log.warning("Edycja z podgladem nieudana (%s) — bez pliku.", exc)
+    await interaction.response.edit_message(embed=embed, view=view)
 
 
 async def send_step(channel: discord.abc.Messageable, session: Session, index: int) -> None:
@@ -3224,8 +4105,9 @@ async def send_step(channel: discord.abc.Messageable, session: Session, index: i
     profile = profile_by_id(session.user_id)
     level = profile.level if profile else 0
     locked = level < min_level_of(step)
-    await channel.send(embed=step_embed(step, index, chosen, level),
-                       view=step_view(index, chosen, locked, min_level_of(step)))
+    await send_with_image(channel, key=step_image_key(step), data=step_image(step),
+                          embed=step_embed(step, index, chosen, level),
+                          view=step_view(index, chosen, locked, min_level_of(step)))
 
 
 async def send_summary(channel: discord.abc.Messageable, session: Session) -> None:
@@ -3235,14 +4117,18 @@ async def send_summary(channel: discord.abc.Messageable, session: Session) -> No
     if link:
         embed.add_field(name="🖼️ Podgląd kombinacji (live)",
                         value=f"[Otwórz podgląd w przeglądarce]({link})\nZobacz dokładnie, co wchodzi do paczki.")
-    await channel.send(embed=embed, view=LayoutView(
-        [btn("citizen_finish", "Zakończ tworzenie", discord.ButtonStyle.success, "📦"),
-         btn("citizen_restart", "Zacznij od nowa", discord.ButtonStyle.secondary, "🔄"),
-         btn("session_close", "Zamknij", discord.ButtonStyle.danger, "🔒")],
-        [select("build_pick", "🎮 Docelowy build GTA V / FiveM...",
-                [opt(b["name"], b["id"], b["note"], default=(b["id"] == session.build_id))
-                 for b in GAME_BUILDS])],
-    ))
+    pozycje = len(session.choices) + len(session.collect_skins()) + len(session.uploads)
+    rows: List[Any] = [[
+        btn("citizen_finish", f"📦 Zbuduj paczkę ({pozycje})", discord.ButtonStyle.success),
+        btn("citizen_restart", "🔄 Zacznij od nowa", discord.ButtonStyle.secondary),
+        btn("session_close", "🔒 Zamknij", discord.ButtonStyle.danger),
+    ], [
+        btn("citizen_upload", "📎 Dodaj własny plik", discord.ButtonStyle.secondary),
+        btn("citizen_back:0", "◀ Wróć do 1. opcji", discord.ButtonStyle.secondary),
+    ], [select("build_pick", "🎮 Docelowy build GTA V / FiveM...",
+               [opt(b["name"], b["id"], b["note"], default=(b["id"] == session.build_id))
+                for b in GAME_BUILDS])]]
+    await channel.send(embed=embed, view=LayoutView(*rows))
 
 # ============================================================================
 # 20. WEAPON SKIN STUDIO — widoki
@@ -3270,7 +4156,7 @@ def skin_embed(weapon: Dict[str, Any], skin_index: int, session: Session,
                      + f"\n\n🎮 Build paczki: **{build_by_id(session.build_id)['name']}**"),
         color=C_YELLOW if locked else (C_GREEN if chosen else C_PURPLE),
     )
-    embed.set_image(url=skin["image"])
+    embed.set_image(url=embed_image_ref(skin_image_key(weapon, skin)))
     total_pages = page_count(len(weapon["skins"]), SKINS_PER_PAGE)
     embed.set_footer(text=(f"Skin {skin_index + 1}/{len(weapon['skins'])} • strona "
                            f"{skin_page_of(skin_index) + 1}/{total_pages} • "
@@ -3322,18 +4208,23 @@ def skin_view(weapon: Dict[str, Any], skin_index: int, session: Session) -> disc
                                 f"Strona {page + 2}/{total_pages} »", discord.ButtonStyle.secondary))
     if page_buttons:
         rows.append(page_buttons)
-    rows.append(skin_nav_row())
+    rows.extend(skin_nav_row())
     return LayoutView(*rows)
 
 
-def skin_nav_row() -> List[discord.ui.Button]:
-    """Przyciski nawigacji studia skinów."""
+def skin_nav_row() -> List[List[discord.ui.Button]]:
+    """Przyciski nawigacji studia skinów (dwa rzędy — Discord: maks. 5 w rzędzie)."""
     return [
-        btn("ws_back_to_weapons", "← Inna broń", discord.ButtonStyle.secondary, "🔫"),
-        btn("ws_search_start", "🔎 Szukaj skinów (.rpf)", discord.ButtonStyle.secondary),
-        btn("ws_summary", "Podsumowanie", discord.ButtonStyle.secondary, "📋"),
-        btn("ws_finish", "Zakończ i zbuduj paczkę", discord.ButtonStyle.success, "📦"),
-        btn("session_close", "Zamknij", discord.ButtonStyle.danger, "🔒"),
+        [
+            btn("ws_back_to_weapons", "← Inna broń", discord.ButtonStyle.secondary, "🔫"),
+            btn("ws_search_start", "🔎 Szukaj (.rpf)", discord.ButtonStyle.secondary),
+            btn("ws_upload", "📎 Własny skin", discord.ButtonStyle.secondary),
+        ],
+        [
+            btn("ws_summary", "Podsumowanie", discord.ButtonStyle.secondary, "📋"),
+            btn("ws_finish", "Zakończ i zbuduj paczkę", discord.ButtonStyle.success, "📦"),
+            btn("session_close", "Zamknij", discord.ButtonStyle.danger, "🔒"),
+        ],
     ]
 
 
@@ -3375,7 +4266,25 @@ async def send_skin_gallery(channel: discord.abc.Messageable, session: Session,
             if skin["id"] == chosen_id:
                 index = i
                 break
-    await channel.send(embed=skin_embed(weapon, index, session), view=skin_view(weapon, index, session))
+    skin = weapon["skins"][index]
+    await send_with_image(channel, key=skin_image_key(weapon, skin), data=skin_image(weapon, skin),
+                          embed=skin_embed(weapon, index, session),
+                          view=skin_view(weapon, index, session))
+
+
+async def show_skin(interaction: discord.Interaction, weapon: Dict[str, Any], index: int,
+                    session: Session, level: Optional[int] = None) -> None:
+    """Odświeża podgląd skina w tej samej wiadomości (razem z wygenerowaną grafiką)."""
+    skins = weapon["skins"]
+    index = max(0, min(index, len(skins) - 1))
+    skin = skins[index]
+    if level is None:
+        profile = profile_by_id(session.user_id)
+        level = profile.level if profile else 0
+    await edit_with_image(interaction, key=skin_image_key(weapon, skin),
+                          data=skin_image(weapon, skin),
+                          embed=skin_embed(weapon, index, session, level),
+                          view=skin_view(weapon, index, session))
 
 
 async def send_search_prompt(channel: discord.abc.Messageable) -> None:
@@ -3465,20 +4374,29 @@ async def send_search_page(channel: discord.abc.Messageable, session: Session, p
 
 
 async def send_skins_summary(channel: discord.abc.Messageable, session: Session) -> None:
-    """Podsumowanie paczki skinów + podgląd."""
+    """Podsumowanie paczki skinów + własne pliki gracza + podgląd kombinacji."""
     skins = session.collect_skins()
+    uploads = session.collect_uploads()
     build = build_by_id(session.build_id)
-    embed = discord.Embed(
-        title="📋 Podsumowanie paczki skinów",
-        description="\n".join(f"✅ **{s['name']}** — {s.get('description') or ''}" for s in skins)
-        or "*Nie wybrano żadnego skina.*", color=C_YELLOW)
+    lines = [f"✅ **{s['name']}** — {s.get('description') or ''}" for s in skins]
+    if uploads:
+        lines += ["", f"📎 **Własne pliki ({len(uploads)}):**"]
+        lines += [f"• `{u['name']}` ({u.get('size', 0) / 1024:.0f} KB) → `{u['target']}`"
+                  for u in uploads[:15]]
+    if not lines:
+        lines = ["*Nie wybrano żadnego skina.*",
+                 "Wybierz skin w galerii, wyszukaj plik .rpf (🔎) albo wrzuć swój przyciskiem 📎 Własny skin."]
+    embed = discord.Embed(title="📋 Podsumowanie paczki skinów",
+                          description="\n".join(lines), color=C_YELLOW)
     embed.add_field(name="🎮 Docelowy build GTA V", value=build["name"])
-    link = publish_skins_preview(session, skins)
+    embed.add_field(name="📦 Pozycji w paczce",
+                    value=f"**{len(skins) + len(uploads)}** (skiny: {len(skins)}, własne: {len(uploads)})")
+    link = publish_skins_preview(session, list(skins) + uploads)
     if link:
         embed.add_field(name="🖼️ Podgląd kombinacji (live)",
                         value=f"[Otwórz podgląd w przeglądarce]({link})")
-    embed.set_footer(text="Kliknij „Zakończ i zbuduj paczkę', aby wygenerować ZIP.")
-    await channel.send(embed=embed, view=LayoutView(skin_nav_row()))
+    embed.set_footer(text="Kliknij „Zakończ i zbuduj paczkę”, aby wygenerować ZIP.")
+    await channel.send(embed=embed, view=LayoutView(*skin_nav_row()))
 
 # ============================================================================
 # 21. TICKETY, SETUP SERWERA, PANEL /system
@@ -3627,22 +4545,28 @@ async def setup_guild(guild: discord.Guild) -> None:
         LayoutView([btn("create_weapon_skins", "Stwórz skiny broni", discord.ButtonStyle.primary, "🔫")]),
     )
 
-    # --- 📦 MOD FEED ---
+    # --- 📦 MOD FEED (kanały tematyczne live feedu) ---
     mods_cat = await ensure_category(guild, CAT_MODS)
     mods_ch = await ensure_text_channel(guild, mods_cat, CH_MODS_LIVE,
-                                       "🔥 NOWE Mody klienckie z YouTube — na żywo.")
+                                       "🔥 Archiwum feedu — reszta modów klienckich z YouTube.")
+    feed_mods = await ensure_text_channel(guild, mods_cat, CH_FEED_MODS,
+                                          FEED_CHANNEL_TOPICS[CH_FEED_MODS])
+    feed_skins = await ensure_text_channel(guild, mods_cat, CH_FEED_SKINS,
+                                          FEED_CHANNEL_TOPICS[CH_FEED_SKINS])
+    feed_pc = await ensure_text_channel(guild, mods_cat, CH_FEED_PC,
+                                       FEED_CHANNEL_TOPICS[CH_FEED_PC])
     await ensure_text_channel(guild, mods_cat, CH_HELP, "Masz problem z modem? Pisz tutaj.")
 
     if not await panel_exists(mods_ch, None):
         await mods_ch.send(embed=discord.Embed(
             title="📡 Live Mod Feed — jak to działa",
-            description=(f"Bot **co {YT_SCAN_MINUTES} minut** sprawdza YouTube i wrzuca najnowsze "
-                         "**mody klienckie**:\n"
-                         "• ⚙️ OPTI / FPS boost packi\n"
-                         "• 🥔 POTATO graphics (plastelina, low-poly mapa)\n"
-                         "• 🎮 First person / low poly citizen\n"
-                         "• 🔫 Skin packi do broni (.rpf)\n"
-                         "• 🗺️ Mapy PvP client-side\n\n"
+            description=(f"Bot **co {YT_SCAN_MINUTES} minut** skanuje YouTube i wrzuca filmy "
+                         f"z ostatnich **{YT_MAX_AGE_DAYS} dni**:\n"
+                         f"• {feed_skins.mention} — skin packi i tekstury **.rpf** do broni\n"
+                         f"• {feed_mods.mention} — mody OPTI / FPS / potato / first person / mapy / auta\n"
+                         f"• {feed_pc.mention} — **optymalizacja komputera**: Windows, GPU, stutter, ping\n\n"
+                         "Kategorię bot rozpoznaje po tytule filmu; niesklasyfikowane trafiają tutaj "
+                         "(na archiwum).\n\n"
                          "**Filtry:** odrzucamy skrypty serwerowe (ESX/QBCore/.lua), cheaty i clickbaity.\n\n"
                          "⚠️ Mody klienckie wrzucasz do folderu `mods` w `FiveM.app` i działają na "
                          "serwerach, które ich nie blokują."),
@@ -4330,6 +5254,15 @@ async def http_download(request: web.Request) -> web.StreamResponse:
     })
 
 
+async def http_image(request: web.Request) -> web.Response:
+    """GET /img/<klucz>.png — generowany podgląd kroku citizena lub skina broni."""
+    data = image_bytes_for(request.match_info.get("key", ""))
+    if not data:
+        return web.Response(text="404: brak podglądu", status=404)
+    return web.Response(body=data, content_type="image/png",
+                        headers={"Cache-Control": "public, max-age=86400"})
+
+
 async def http_preview(request: web.Request) -> web.Response:
     """GET /preview/<token> — podgląd kombinacji (Live Before/After)."""
     preview = STORAGE.get_preview(request.match_info["token"])
@@ -4455,6 +5388,7 @@ def create_http_app() -> web.Application:
     app.router.add_get("/health", http_health)
     app.router.add_get("/download/{token}", http_download)
     app.router.add_get("/preview/{token}", http_preview)
+    app.router.add_get("/img/{key}", http_image)
     app.router.add_get("/api/pack/{token}", http_api_pack)
     app.router.add_get("/api/profile/{user_id}", http_api_profile)
     app.router.add_get("/api/bridge/inbox", http_api_bridge_inbox)
@@ -4883,7 +5817,16 @@ class FoundryBot(discord.Client):
         if message.author.bot or not message.guild:
             return
         session = session_get(message.channel.id)
-        if not session or session.user_id != message.author.id or not session.search_mode:
+        if not session or session.user_id != message.author.id:
+            return
+        # 1) Własne pliki gracza (przycisk 📎) — załącznik albo wklejony link.
+        if session.upload_armed:
+            try:
+                if await handle_upload_message(message, session):
+                    return
+            except Exception as exc:  # noqa: BLE001
+                upload_log.error("Blad obslugi wlasnego pliku: %s", exc, exc_info=True)
+        if not session.search_mode:
             return
         query = message.content.strip()
         if len(query) < 2 or query.startswith("/"):
@@ -5009,14 +5952,73 @@ class FoundryBot(discord.Client):
                 else:
                     session.choices.append(step["id"])
                 chosen = step["id"] in session.choices
-                await interaction.response.edit_message(embed=step_embed(step, index, chosen, level),
-                                                       view=step_view(index, chosen, False))
+                await edit_with_image(interaction, key=step_image_key(step), data=step_image(step),
+                                      embed=step_embed(step, index, chosen, level),
+                                      view=step_view(index, chosen, False))
                 return
 
             if custom_id.startswith("citizen_skip:"):
+                # „Pomiń i dalej” = nie chcę tej opcji (cofa wybór, jeśli był) i idziemy dalej.
+                index = int(custom_id.split(":", 1)[1])
+                step = CITIZEN_STEPS[index]
+                if step["id"] in session.choices:
+                    session.choices.remove(step["id"])
+                await interaction.response.defer()
+                await send_step(interaction.channel, session, index + 1)
+                return
+
+            if custom_id.startswith("citizen_next:"):
+                # „Dalej” = zostaw wybór taki, jaki jest, i pokaż kolejną opcję.
                 index = int(custom_id.split(":", 1)[1])
                 await interaction.response.defer()
                 await send_step(interaction.channel, session, index + 1)
+                return
+
+            if custom_id.startswith("citizen_back:"):
+                index = int(custom_id.split(":", 1)[1])
+                await interaction.response.defer()
+                await send_step(interaction.channel, session, max(0, index - 1))
+                return
+
+            # --- własne pliki gracza (📎) ---
+            if custom_id == "citizen_upload":
+                session.upload_kind = "citizen"
+                session.upload_armed = True
+                session.upload_target = session.upload_target or T_MODS
+                await interaction.response.send_message(
+                    embed=upload_prompt_embed(session), view=upload_target_buttons(), ephemeral=True)
+                return
+
+            if custom_id == "ws_upload":
+                session.upload_kind = "weapons"
+                session.upload_armed = True
+                session.upload_target = T_WEAPONS_TEX
+                await interaction.response.send_message(
+                    embed=upload_prompt_embed(session), view=upload_target_buttons(), ephemeral=True)
+                return
+
+            if custom_id.startswith("upload_target:"):
+                session.upload_target = custom_id.split(":", 1)[1] or T_MODS
+                session.upload_armed = True
+                await interaction.response.edit_message(
+                    embed=upload_prompt_embed(session, session.upload_target),
+                    view=LayoutView([btn("upload_cancel", "✖ Anuluj", discord.ButtonStyle.danger)]))
+                return
+
+            if custom_id == "upload_cancel":
+                session.upload_armed = False
+                await interaction.response.edit_message(
+                    embed=discord.Embed(title="✖ Anulowano",
+                                        description="Własny plik nie został dodany.",
+                                        color=C_BLUE), view=None)
+                return
+
+            if custom_id == "upload_done":
+                await interaction.response.defer()
+                if session.upload_kind == "weapons":
+                    await send_skins_summary(interaction.channel, session)
+                else:
+                    await send_summary(interaction.channel, session)
                 return
 
             if custom_id.startswith("citizen_jump:"):
@@ -5036,9 +6038,10 @@ class FoundryBot(discord.Client):
                 return
 
             if custom_id == "citizen_finish":
-                kept, _dropped, conflicts = resolve_conflicts(session.chosen_steps())
+                items = session.package_items("citizen")
+                _kept, _dropped, conflicts = resolve_conflicts(session.chosen_steps())
                 await interaction.response.defer()
-                await deliver_package(interaction, session, kept, "citizen", conflicts)
+                await deliver_package(interaction, session, items, "citizen", conflicts)
                 return
 
             # --- Weapon Skin Studio ---
@@ -5070,8 +6073,7 @@ class FoundryBot(discord.Client):
                         f"{lock_text(skin)}\n\nTwój poziom: **{level}**.", ephemeral=True)
                     return
                 session.weapon_skins[weapon["id"]] = skin["id"]
-                await interaction.response.edit_message(embed=skin_embed(weapon, index, session, level),
-                                                       view=skin_view(weapon, index, session))
+                await show_skin(interaction, weapon, index, session, level)
                 return
 
             if custom_id.startswith(("ws_prev:", "ws_next:")):
@@ -5083,8 +6085,7 @@ class FoundryBot(discord.Client):
                 total = len(weapon["skins"])
                 index = int(index_str)
                 index = (index + 1) % total if action == "ws_next" else (index - 1) % total
-                await interaction.response.edit_message(embed=skin_embed(weapon, index, session),
-                                                       view=skin_view(weapon, index, session))
+                await show_skin(interaction, weapon, index, session)
                 return
 
             if custom_id.startswith("ws_page:"):
@@ -5102,8 +6103,7 @@ class FoundryBot(discord.Client):
                         if skin["id"] == chosen_id and skin_page_of(i) == page:
                             index = i
                             break
-                await interaction.response.edit_message(embed=skin_embed(weapon, index, session),
-                                                       view=skin_view(weapon, index, session))
+                await show_skin(interaction, weapon, index, session)
                 return
 
             if custom_id.startswith(("ws_choose:", "ws_locked:")):
@@ -5125,8 +6125,7 @@ class FoundryBot(discord.Client):
                     session.weapon_skins.pop(weapon["id"], None)
                 else:
                     session.weapon_skins[weapon["id"]] = skin["id"]
-                await interaction.response.edit_message(embed=skin_embed(weapon, index, session),
-                                                       view=skin_view(weapon, index, session))
+                await show_skin(interaction, weapon, index, session)
                 return
 
             if custom_id == "ws_back_to_weapons":
@@ -5208,7 +6207,7 @@ class FoundryBot(discord.Client):
                 return
 
             if custom_id == "ws_finish":
-                skins = session.collect_skins()
+                skins = session.collect_skins() + session.collect_uploads()
                 await interaction.response.defer()
                 await deliver_package(interaction, session, skins, "weapons", [])
                 return
@@ -5388,15 +6387,21 @@ async def handle_build_pick(interaction: discord.Interaction, session: Session,
 
     if "Podsumowanie paczki skinów" in title:
         skins = session.collect_skins()
+        uploads = session.collect_uploads()
+        lines = [f"✅ **{s['name']}** — {s.get('description') or ''}" for s in skins]
+        if uploads:
+            lines += ["", f"📎 **Własne pliki ({len(uploads)}):**"]
+            lines += [f"• `{u['name']}` → `{u['target']}`" for u in uploads[:15]]
         embed = discord.Embed(
             title="📋 Podsumowanie paczki skinów",
-            description="\n".join(f"✅ **{s['name']}** — {s.get('description') or ''}" for s in skins)
-            or "*Nie wybrano żadnego skina.*", color=C_YELLOW)
+            description="\n".join(lines) or "*Nie wybrano żadnego skina.*", color=C_YELLOW)
         embed.add_field(name="🎮 Docelowy build GTA V", value=build["name"])
-        link = publish_skins_preview(session, skins)
+        embed.add_field(name="📦 Pozycji w paczce",
+                        value=f"**{len(skins) + len(uploads)}** (skiny: {len(skins)}, własne: {len(uploads)})")
+        link = publish_skins_preview(session, list(skins) + uploads)
         if link:
             embed.add_field(name="🖼️ Podgląd kombinacji (live)", value=f"[Otwórz podgląd]({link})")
-        await interaction.response.edit_message(embed=embed, view=LayoutView(skin_nav_row()))
+        await interaction.response.edit_message(embed=embed, view=LayoutView(*skin_nav_row()))
         return
 
     await interaction.response.send_message(f"✅ Docelowy build: **{build['name']}**", ephemeral=True)
