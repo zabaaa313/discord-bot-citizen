@@ -1,0 +1,62 @@
+[
+  {
+    "name": "Pistol",
+    "category": "pistolety",
+    "file": "w_pi_pistol.rpf",
+    "url": "https://raw.githubusercontent.com/NoobySloth/Custom-Weapons/main/weapons/pistol.rpf"
+  },
+  {
+    "name": "Pistol MK2",
+    "category": "pistolety",
+    "file": "w_pi_pistol_mk2.rpf",
+    "url": "https://raw.githubusercontent.com/NoobySloth/Custom-Weapons/main/weapons/pistol_mk2.rpf"
+  },
+  {
+    "name": "Combat Pistol",
+    "category": "pistolety",
+    "file": "w_pi_combatpistol.rpf",
+    "url": "https://raw.githubusercontent.com/Branqueador/GGC-Weapons/main/weapons/combatpistol.rpf"
+  },
+  {
+    "name": "Heavy Pistol",
+    "category": "pistolety",
+    "file": "w_pi_heavypistol.rpf",
+    "url": "https://raw.githubusercontent.com/Branqueador/GGC-Weapons/main/weapons/heavypistol.rpf"
+  },
+  {
+    "name": "Vintage Pistol",
+    "category": "pistolety",
+    "file": "w_pi_vintagepistol.rpf",
+    "url": "https://raw.githubusercontent.com/NoobySloth/Custom-Weapons/main/weapons/vintagepistol.rpf"
+  },
+  {
+    "name": "SNS Pistol",
+    "category": "pistolety",
+    "file": "w_pi_sns_pistol.rpf",
+    "url": "https://raw.githubusercontent.com/NoobySloth/Custom-Weapons/main/weapons/snspistol.rpf"
+  },
+  {
+    "name": "SNS Pistol MK2",
+    "category": "pistolety",
+    "file": "w_pi_sns_pistol_mk2.rpf",
+    "url": "https://raw.githubusercontent.com/NoobySloth/Custom-Weapons/main/weapons/sns_pistol_mk2.rpf"
+  },
+  {
+    "name": "Heavy Pistol .50",
+    "category": "pistolety",
+    "file": "w_pi_pistol50.rpf",
+    "url": "https://raw.githubusercontent.com/NoobySloth/Custom-Weapons/main/weapons/pistol50.rpf"
+  },
+  {
+    "name": "Ceramic Pistol",
+    "category": "pistolety",
+    "file": "w_pi_ceramic_pistol.rpf",
+    "url": "https://raw.githubusercontent.com/NoobySloth/Custom-Weapons/main/weapons/ceramicpistol.rpf"
+  },
+  {
+    "name": "Navy Revolver",
+    "category": "pistolety",
+    "file": "w_pi_revolvernavy.rpf",
+    "url": "https://raw.githubusercontent.com/Branqueador/GGC-Weapons/main/weapons/revolvernavy.rpf"
+  }
+]
