@@ -52,10 +52,12 @@ from discord import app_commands
 from dotenv import load_dotenv
 
 # Generator plików citizena (te same pliki, zmienione wartości)
+import citizen_gen
 from citizen_gen import (
     CITIZEN_GENERATED_STEPS,
     SKY_PRESETS,
     generate_citizen_file,
+    sky_preset_params,
 )
 # Kreator WWW (ładna strona: 1 opcja na ekran + duży podgląd)
 import web_creator
@@ -687,6 +689,7 @@ footer{color:var(--muted);font-size:12px;padding:22px;text-align:center}
 
 img_log = log("Podglady")
 PREVIEW_W, PREVIEW_H = 640, 360
+BLOOK = 4  # rozmiar bloku renderowania podglądów (4x4 px = gładko i szybko)
 _IMAGE_CACHE: Dict[str, bytes] = {}
 
 # Palety kroków citizena: (niebo, ziemia, akcent) — pokazują efekt opcji.
@@ -790,6 +793,219 @@ def _disc(buf: List[List[Tuple[int, int, int]]], cx: int, cy: int, radius: int,
                 buf[y][x] = color
 
 
+def _f01(value: float) -> int:
+    """Parametr sggd (0..1+) na kanał 0-255."""
+    return max(0, min(255, int(round(float(value) * 255))))
+
+
+def _cloud_cover(density: float, seed: int) -> float:
+    """Deterministyczne pokrycie chmurami 0..1 na bazie gęstości z sggd."""
+    rng = random.Random(seed)
+    return max(0.0, min(1.0, density * (0.75 + rng.random() * 0.5)))
+
+
+def sky_png(params: Dict[str, float], seed: int = 0, *, rain: float = 0.0,
+            grade: Optional[str] = None, storm: bool = False, blood: float = 0.0,
+            blood_head: float = 0.0, sun: str = "mid", moon_big: bool = False) -> bytes:
+    """
+    REALISTYCZNY podgląd nieba z parametrów sggd.xml (to co gracz zobaczy w grze):
+      • gradient zenith -> horizon z realnych kolorów (sky_zenith_col, sky_horizon_col)
+      • poświata azymutalna przy horyzoncie (sky_azimuth_east/west/transition)
+      • słońce (intensywność) i KSIĘŻYC (sky_moon_iten, sky_moon_disc_size)
+      • CHMURY — deterministyczne kłęby, gęstość wg sky_cloud_density_mult
+    """
+    rng = random.Random(seed or 7)
+    zenith = (_f01(params.get("sky_zenith_col_r", .3)),
+              _f01(params.get("sky_zenith_col_g", .5)),
+              _f01(params.get("sky_zenith_col_b", .9)))
+    horizon = (_f01(params.get("sky_horizon_col_r", .6)),
+               _f01(params.get("sky_horizon_col_g", .75)),
+               _f01(params.get("sky_horizon_col_b", .95)))
+    east = (_f01(params.get("sky_azimuth_east_col_r", .9)),
+            _f01(params.get("sky_azimuth_east_col_g", .8)),
+            _f01(params.get("sky_azimuth_east_col_b", .6)))
+    west = (_f01(params.get("sky_azimuth_west_col_r", .85)),
+            _f01(params.get("sky_azimuth_west_col_g", .7)),
+            _f01(params.get("sky_azimuth_west_col_b", .55)))
+
+    moon_inten = max(0.0, min(1.0, float(params.get("sky_moon_iten", .35))))
+    moon_size = float(params.get("sky_moon_disc_size", 1.0))
+    sun_glow = max(0.2, min(2.5, float(params.get("sky_sunburst_imten", 1.0))))
+    density = max(0.0, min(1.0, float(params.get("sky_cloud_density_mult", .35))))
+    if moon_big:                      # podgląd „Wielki księżyc”
+        moon_inten = max(moon_inten, 0.9)
+        moon_size = max(moon_size, 2.2)
+    if storm:                         # podgląd „Klimat burzowy”
+        density = max(density, 0.9)
+
+    horizon_y = int(PREVIEW_H * 0.78)
+    ground = _mix((24, 28, 34), horizon, 0.35)   # ciemna sylwetka terenu
+
+    buf: List[List[Tuple[int, int, int]]] = [[zenith for _ in range(PREVIEW_W)]
+                                             for _ in range(PREVIEW_H)]
+
+    # --- gradient nieba: zenith na górze -> horizon przy linii ---
+    for y in range(horizon_y):
+        t = y / max(1, horizon_y)
+        row_color = _mix(zenith, horizon, t ** 0.9)
+        _rect(buf, 0, y, PREVIEW_W, y + 1, row_color)
+
+    # --- poświata azymutalna (wschód=złoto przy słońcu, zachód chłodniejszy) ---
+    sun_x = int(PREVIEW_W * 0.72)
+    sun_y_factor = {"high": 0.14, "mid": 0.30, "low": 0.74}.get(sun, 0.30)
+    sun_y = int(horizon_y * sun_y_factor)
+    glow_radius = PREVIEW_W * 0.45 * sun_glow
+    for y in range(0, horizon_y, BLOOK):        # pętla po blokach 4x4 (glow i tak jest gładki)
+        for x in range(0, PREVIEW_W, BLOOK):
+            xm, ym = min(x + BLOOK // 2, PREVIEW_W - 1), min(y + BLOOK // 2, horizon_y - 1)
+            dist_sun = ((xm - sun_x) ** 2 + (ym - sun_y) ** 2) ** 0.5
+            glow = max(0.0, 1.0 - dist_sun / glow_radius)
+            col = _mix(buf[ym][xm], east, glow * 0.55) if glow > 0 else buf[ym][xm]
+            dist_h = (horizon_y - ym) / max(1, horizon_y)
+            if xm < PREVIEW_W * 0.25 and dist_h < 0.35:
+                col = _mix(col, west, (0.35 - dist_h) * 1.2)
+            for yy in range(y, min(y + BLOOK, horizon_y)):
+                row = buf[yy]
+                for xx in range(x, min(x + BLOOK, PREVIEW_W)):
+                    row[xx] = col
+
+    # --- chmury (deterministyczne kłęby, alpha wg gęstości) ---
+    if density > 0.02:
+        cover = _cloud_cover(density, seed or 7)
+        puffs = int(10 + cover * 42)
+        for _ in range(puffs):
+            cx, cy = rng.randint(-40, PREVIEW_W + 40), rng.randint(8, horizon_y - 30)
+            base_r = rng.randint(14, 40)
+            shade = _mix((250, 250, 252), _mix(east, (60, 70, 95), 0.5), rng.random() * 0.7)
+            for part in range(rng.randint(4, 9)):
+                px = cx + rng.randint(-int(base_r * 1.6), int(base_r * 1.6))
+                py = cy + rng.randint(-base_r // 2, base_r // 2)
+                pr = max(6, int(base_r * (0.4 + rng.random() * 0.7)))
+                # rozmycie: malujemy 3 warstwy o rosnącym promieniu i malejącej sile
+                for ring, strength in ((pr, 0.16), (int(pr * 0.8), 0.3), (int(pr * 0.55), 0.5)):
+                    _disc_soft(buf, px, py, ring, shade, strength, limit_y=horizon_y)
+
+    # --- słońce (tarcza + halo) ---
+    sun_r = int(15 * sun_glow)
+    _disc_soft(buf, sun_x, sun_y, int(sun_r * 2.4), _mix(east, (255, 250, 220), 0.6), 0.35,
+               limit_y=horizon_y)
+    _disc(buf, sun_x, sun_y, sun_r, _mix(east, (255, 255, 240), 0.85))
+
+    # --- księżyc (widoczny wg intensywności; duży gdy moon_disc_size > 1) ---
+    if moon_inten > 0.05:
+        moon_x, moon_y = int(PREVIEW_W * 0.18), int(horizon_y * 0.28)
+        moon_r = max(7, int(13 * moon_size))
+        glow_m = _mix((200, 210, 255), (255, 255, 255), moon_inten)
+        _disc_soft(buf, moon_x, moon_y, int(moon_r * 2.0), glow_m, 0.30 * moon_inten, limit_y=horizon_y)
+        _disc(buf, moon_x, moon_y, moon_r, _mix((225, 230, 245), (255, 255, 255), moon_inten))
+        # cień/krater dla realizmu
+        _disc(buf, moon_x + moon_r // 3, moon_y - moon_r // 4, max(2, moon_r // 4),
+              _mix(glow_m, (140, 150, 180), 0.35))
+
+    # --- ziemia (sylwetka + odbicie koloru horyzontu) ---
+    _rect(buf, 0, horizon_y, PREVIEW_W, PREVIEW_H, ground)
+    # prosty krajobraz: wzgórza
+    hill_h = int((PREVIEW_H - horizon_y) * 0.35)
+    for x in range(PREVIEW_W):
+        h = hill_h // 2 + int((hill_h / 2) * (1 + __import__("math").sin(x * 0.02 + seed % 7)))
+        _rect(buf, x, horizon_y + hill_h - h, x + 1, PREVIEW_H, _mix(ground, (8, 9, 12), 0.45))
+
+    # --- KREW (podgląd efektów kombat: baza + kill + head razem) ---
+    if blood > 0 or blood_head > 0:
+        rng_b = random.Random((seed or 7) + 991)
+        ground_hits = int(12 * min(1.5, blood))
+        head_hits = int(7 * blood_head)
+        for i in range(ground_hits + head_hits):
+            if i < ground_hits:      # plamy na ziemi/wzgórzach (kill + baza)
+                cx = rng_b.randint(15, PREVIEW_W - 15)
+                cy = rng_b.randint(horizon_y + 8, PREVIEW_H - 6)
+                r = rng_b.randint(5, int(10 + 24 * min(1.0, blood + 0.2)))
+            else:                    # trysk w powietrzu (headshot)
+                cx = rng_b.randint(int(PREVIEW_W * 0.3), int(PREVIEW_W * 0.7))
+                cy = rng_b.randint(int(horizon_y * 0.30), horizon_y - 25)
+                r = rng_b.randint(4, int(8 + 18 * blood_head))
+            col = _mix((168, 18, 28), (225, 45, 45), rng_b.random() * 0.5)
+            _disc_soft(buf, cx, cy, r, col, 0.8)
+        if blood > 0:                # czerwona poświata sceny
+            for y in range(horizon_y, PREVIEW_H):
+                row = buf[y]
+                for x in range(PREVIEW_W):
+                    row[x] = _mix(row[x], (120, 12, 20), 0.12 * min(1.0, blood))
+
+    # --- BURZA: przyciemnienie + DESZCZ (krople widoczne jak w grze) ---
+    if storm:
+        for y in range(PREVIEW_H):
+            row = buf[y]
+            for x in range(PREVIEW_W):
+                row[x] = _mix(row[x], (34, 40, 56), 0.30)
+    if rain > 0.02:
+        rng_r = random.Random((seed or 7) + 517)
+        col_r = _mix(horizon, (200, 220, 245), 0.6)
+        for _ in range(int(rain * 320)):
+            x0 = rng_r.randint(0, PREVIEW_W - 8)
+            y0 = rng_r.randint(0, PREVIEW_H - 22)
+            for i in range(rng_r.randint(9, 20)):
+                xx, yy = x0 + i // 3, y0 + i
+                if 0 <= yy < PREVIEW_H and 0 <= xx < PREVIEW_W:
+                    buf[yy][xx] = _mix(buf[yy][xx], col_r, 0.45)
+
+    # --- GRADING POSTFX (vivid / cold / film) — jak timecycle_mods_4 ---
+    # Grading blokami 4x4 px (środek bloku jako reprezentant) — wizualnie gładkie,
+    # a ~16x szybsze niż per-piksel.
+    if grade in ("vivid", "cold", "film"):
+        cx, cy = PREVIEW_W / 2, PREVIEW_H / 2
+        dmax = (cx * cx + cy * cy) ** 0.5
+        STEP = 4
+        for gy in range(0, PREVIEW_H, STEP):
+            y1 = min(gy + STEP, PREVIEW_H)
+            for gx in range(0, PREVIEW_W, STEP):
+                x1 = min(gx + STEP, PREVIEW_W)
+                xm, ym = min(gx + STEP // 2, PREVIEW_W - 1), min(gy + STEP // 2, PREVIEW_H - 1)
+                out = _pixel_grade(grade, buf[ym][xm], xm, ym, cx, cy, dmax)
+                for y in range(gy, y1):
+                    row = buf[y]
+                    for x in range(gx, x1):
+                        row[x] = out
+
+    return png_encode(buf)
+
+
+def _pixel_grade(grade: str, rgb: Tuple[int, int, int], x: int, y: int,
+                 cx: float, cy: float, dmax: float) -> Tuple[int, int, int]:
+    """Grading dla pojedynczego piksela (fallback poza siatką LUT)."""
+    r0, g0, b0 = rgb
+    if grade == "vivid":
+        l = (r0 + g0 + b0) // 3
+        return (max(0, min(255, int(l + (r0 - l) * 1.45))),
+                max(0, min(255, int(l + (g0 - l) * 1.45))),
+                max(0, min(255, int(l + (b0 - l) * 1.45))))
+    if grade == "cold":
+        return _mix((r0, g0, b0), (150, 180, 235), 0.16)
+    d = (((x - cx) ** 2 + (y - cy) ** 2) ** 0.5) / dmax
+    r, g, b = r0, g0, b0
+    if (r + g + b) // 3 < 110:
+        r, g, b = _mix((r, g, b), (60, 80, 92), 0.22)
+    f = 1.0 - 0.45 * d * d
+    return (max(0, min(255, int(r * f))),
+            max(0, min(255, int(g * f))),
+            max(0, min(255, int(b * f))))
+
+
+def _disc_soft(buf: List[List[Tuple[int, int, int]]], cx: int, cy: int, radius: int,
+               color: Tuple[int, int, int], strength: float, limit_y: Optional[int] = None) -> None:
+    """Miękkie koło (glow/chmura): mieszanie z tłem o sile `strength` (0..1)."""
+    strength = max(0.0, min(1.0, strength))
+    bottom = limit_y if limit_y is not None else len(buf)
+    r2 = radius * radius
+    for y in range(max(0, cy - radius), min(bottom, cy + radius + 1)):
+        for x in range(max(0, cx - radius), min(len(buf[0]), cx + radius + 1)):
+            d2 = (x - cx) ** 2 + (y - cy) ** 2
+            if d2 <= r2:
+                # feather na krawędzi
+                edge = 1.0 - (d2 / r2) ** 0.5
+                buf[y][x] = _mix(buf[y][x], color, min(1.0, strength * (0.35 + 0.65 * edge)))
+
+
 def scene_png(sky: str, ground: str, accent: str, horizon: float = 0.62) -> bytes:
     """Krajobraz: gradient nieba, podłoga, budynki i słońce w kolorze akcentu."""
     top, bottom, key = _rgb(sky), _rgb(ground), _rgb(accent)
@@ -875,13 +1091,109 @@ def skin_image_key(weapon: Dict[str, Any], skin: Dict[str, Any]) -> str:
     return f"skin-{_safe_key(skin.get('id', 'skin'))}"
 
 
+def _step_seed(step: Dict[str, Any]) -> int:
+    """Deterministyczne ziarno podglądu (ten sam krok = ten sam obrazek)."""
+    return zlib.crc32(str(step.get("id", "")).encode())
+
+
 def step_image(step: Dict[str, Any]) -> bytes:
-    """PNG podglądu kroku citizena (cache w pamięci)."""
+    """
+    PNG podglądu kroku citizena (cache w pamięci + DYSKOWY cache/step_previews).
+    KAŻDY krok pokazuje efekt TAK JAK W GRZE, na wspólnym rendererze sky_png:
+      • nieba         — kolory zenith/horizon/azimuth + chmury + księżyc z sggd
+      • słońce/księżyc— pozycja tarczy / wielkość księżyca
+      • pogoda        — zachmurzenie, burza, deszcz
+      • postfx        — grading vivid/cold/film na całej scenie
+      • kombat        — plamy krwi na ziemi (kill) i w powietrzu (headshot)
+    Render jest kosztowny (~2-4 s), dlatego wynik zapisujemy na dysku —
+    po restarcie bota podglądy ładują się natychmiast.
+    """
+    key = step_image_key(step)
+    cached = _IMAGE_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    disk = CACHE_DIR / "step_previews" / f"{key}.png"
+    if disk.exists():
+        data = disk.read_bytes()
+        if data[:4] == b"\x89PNG":
+            _IMAGE_CACHE[key] = data
+            return data
+
+    png = _render_step_image(step)
+    _IMAGE_CACHE[key] = png
+    try:
+        disk.parent.mkdir(parents=True, exist_ok=True)
+        disk.write_bytes(png)
+    except OSError:  # noqa: BLE001 — brak dysku nie może ubić renderu
+        pass
+    return png
+
+
+def _render_step_image(step: Dict[str, Any]) -> bytes:
+    """Właściwy render podglądu kroku (wolna ścieżka, raz na krok)."""
     key = step_image_key(step)
     if key not in _IMAGE_CACHE:
-        sky, ground, accent = STEP_COLORS.get(str(step.get("id")), ("4a9dff", "6f8f45", "ffd166"))
-        _IMAGE_CACHE[key] = scene_png(sky, ground, accent)
-    return _IMAGE_CACHE[key]
+        params = step.get("gen_params") or {}
+        sid = str(step.get("id", ""))
+        seed = _step_seed(step)
+        base = sky_preset_params("sky-anime")  # neutralna scena bazowa dla efektów
+
+        if step.get("gen_file") == "timecycle/sggd.xml" and params.get("sky_preset"):
+            # niebo: dokładne parametry presetu (+ clouds off/dense)
+            sky_params = sky_preset_params(str(params["sky_preset"]), params)
+            return sky_png(sky_params, seed=seed)
+        elif sid == "sun-always-noon":
+            return sky_png(base, seed=seed, sun="high")
+        elif sid == "sun-low-golden":
+            gold = dict(base)
+            gold.update({"sky_horizon_col_r": 0.95, "sky_horizon_col_g": 0.72,
+                         "sky_horizon_col_b": 0.42, "sky_azimuth_east_col_r": 1.0,
+                         "sky_azimuth_east_col_g": 0.62, "sky_azimuth_east_col_b": 0.25})
+            return sky_png(gold, seed=seed, sun="low")
+        elif sid == "moon-huge":
+            return sky_png(base, seed=seed, moon_big=True)
+        elif sid == "weather-always-clear":
+            clear = dict(base)
+            clear["sky_cloud_density_mult"] = 0.18
+            return sky_png(clear, seed=seed)
+        elif sid == "weather-stormy":
+            return sky_png(base, seed=seed, storm=True, rain=0.85)
+        elif sid == "rain-off":
+            return sky_png(base, seed=seed, rain=0.0)
+        elif sid == "rain-heavy":
+            return sky_png(base, seed=seed, rain=1.0)
+        elif sid == "postfx-vivid":
+            return sky_png(base, seed=seed, grade="vivid")
+        elif sid == "postfx-cold":
+            return sky_png(base, seed=seed, grade="cold")
+        elif sid == "postfx-film":
+            return sky_png(base, seed=seed, grade="film")
+        elif sid == "blood-anime":
+            return sky_png(base, seed=seed, blood=1.0)
+        elif sid == "blood-minimal":
+            return sky_png(base, seed=seed, blood=0.35)
+        elif sid == "blood-none":
+            return sky_png(base, seed=seed, blood=0.0)
+        elif sid == "kill-extreme":
+            return sky_png(base, seed=seed, blood=1.0)
+        elif sid == "kill-strong":
+            return sky_png(base, seed=seed, blood=0.6)
+        elif sid == "kill-off":
+            return sky_png(base, seed=seed, blood=0.0)
+        elif sid == "head-massive":
+            return sky_png(base, seed=seed, blood_head=1.0)
+        elif sid == "head-big":
+            return sky_png(base, seed=seed, blood_head=0.6)
+        elif sid == "head-off":
+            return sky_png(base, seed=seed, blood_head=0.0)
+        else:
+            # pozostałe (chmury-off/dense mają sky_preset=None) — schemat z palety
+            sky, ground, accent = STEP_COLORS.get(sid, ("4a9dff", "6f8f45", "ffd166"))
+            return scene_png(sky, ground, accent)
+    # fallback: schematyczny krajobraz
+    sky, ground, accent = STEP_COLORS.get(str(step.get("id")), ("4a9dff", "6f8f45", "ffd166"))
+    return scene_png(sky, ground, accent)
 
 
 def skin_image(weapon: Dict[str, Any], skin: Dict[str, Any]) -> bytes:
