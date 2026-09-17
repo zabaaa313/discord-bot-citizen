@@ -13,7 +13,9 @@
    cp .env.example .env      (Windows: copy .env.example .env)
    python bot.py
 
- Wymagane zmienne w .env: DISCORD_TOKEN, CLIENT_ID, YOUTUBE_API_KEY, PUBLIC_URL
+ Wymagane zmienne w .env: DISCORD_TOKEN, CLIENT_ID, YOUTUBE_API_KEY
+ (PUBLIC_URL opcjonalny — bez niego paczki i podglądy lecą jako załączniki Discorda,
+  a hostingi Render/Railway/Fly nadają adres publiczny same)
 ==============================================================================
 """
 
@@ -58,8 +60,55 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 CLIENT_ID = os.getenv("CLIENT_ID", "").strip()
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
-HTTP_PORT = int(os.getenv("HTTP_PORT", "3000") or 3000)
-PUBLIC_URL = (os.getenv("PUBLIC_URL") or f"http://localhost:{HTTP_PORT}").rstrip("/")
+# Port: hostingi (Render/Railway/Fly/Heroku/Azure) podają PORT — musi mieć
+# priorytet nad HTTP_PORT, bo na tym porcie działa healthcheck i linki paczek.
+HTTP_PORT = int(os.getenv("PORT") or os.getenv("HTTP_PORT") or "3000")
+
+
+def _clean_url(raw: Optional[str]) -> str:
+    """Normalizuje adres z ENV (dokłada https:// i ucina końcowy ukośnik)."""
+    value = (raw or "").strip().rstrip("/")
+    if value and not value.startswith(("http://", "https://")):
+        value = "https://" + value
+    return value
+
+
+def host_is_local(url: str) -> bool:
+    """Czy adres wskazuje maszynę lokalną (taki link jest bezużyteczny dla graczy)?"""
+    return (urlparse(url).hostname or "").lower() in (
+        "", "localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]")
+
+
+def detect_public_url(port: int) -> Tuple[str, str]:
+    """
+    Adres publiczny bota: PUBLIC_URL z .env, a gdy go brak (albo wskazuje localhost)
+    — adres nadany przez hosting. Zwraca (adres, źródło).
+    """
+    railway = os.getenv("RAILWAY_PUBLIC_DOMAIN") or os.getenv("RAILWAY_STATIC_URL")
+    fly = f"{os.getenv('FLY_APP_NAME')}.fly.dev" if os.getenv("FLY_APP_NAME") else ""
+    heroku = (f"{os.getenv('HEROKU_APP_NAME')}.herokuapp.com"
+              if os.getenv("HEROKU_APP_NAME") else "")
+    candidates: Tuple[Tuple[Optional[str], str], ...] = (
+        (os.getenv("PUBLIC_URL"), "PUBLIC_URL (.env)"),
+        (os.getenv("RENDER_EXTERNAL_URL"), "RENDER_EXTERNAL_URL (Render)"),
+        (railway, "RAILWAY_PUBLIC_DOMAIN (Railway)"),
+        (fly, "FLY_APP_NAME (Fly.io)"),
+        (heroku, "HEROKU_APP_NAME (Heroku)"),
+        (os.getenv("KOYEB_PUBLIC_DOMAIN"), "KOYEB_PUBLIC_DOMAIN (Koyeb)"),
+        (os.getenv("WEBSITE_HOSTNAME"), "WEBSITE_HOSTNAME (Azure)"),
+    )
+    for raw, source in candidates:            # najpierw prawdziwy, publiczny adres
+        url = _clean_url(raw)
+        if url and not host_is_local(url):
+            return url, source
+    for raw, source in candidates:            # potem cokolwiek (np. jawny localhost)
+        url = _clean_url(raw)
+        if url:
+            return url, source
+    return f"http://localhost:{port}", "domyślnie localhost"
+
+
+PUBLIC_URL, PUBLIC_URL_SOURCE = detect_public_url(HTTP_PORT)
 SKIN_INDEX_URL = os.getenv("SKIN_INDEX_URL", "").strip()
 
 YT_SCAN_MINUTES = int(os.getenv("YT_SCAN_MINUTES", "15") or 15)
@@ -95,6 +144,10 @@ STEPS_PER_PAGE = max(5, int(os.getenv("STEPS_PER_PAGE", "24") or 24))
 # --- Własne pliki graczy (przycisk 📎) — bez hostingu, prosto z Discorda ---
 UPLOAD_MAX_MB = max(1, int(os.getenv("UPLOAD_MAX_MB", "25") or 25))
 UPLOAD_MAX_FILES = max(1, int(os.getenv("UPLOAD_MAX_FILES", "20") or 20))
+# --- Wysyłka paczek bez hostingu: załączniki Discorda (fallback dla localhost) ---
+DISCORD_ATTACH_MB = max(1, int(os.getenv("DISCORD_ATTACH_MB", "8") or 8))
+DISCORD_ATTACH_BYTES = DISCORD_ATTACH_MB * 1024 * 1024
+DISCORD_MAX_ATTACHMENTS = 10
 
 ROOT = Path(__file__).parent.resolve()
 DOWNLOADS_DIR = ROOT / "downloads"
@@ -936,8 +989,7 @@ def public_image_url(key: str) -> str:
 
 def public_url_is_public() -> bool:
     """Czy PUBLIC_URL wskazuje publiczny adres (a nie localhost)?"""
-    host = (urlparse(PUBLIC_URL).hostname or "").lower()
-    return bool(host) and host not in ("localhost", "127.0.0.1", "0.0.0.0", "::1")
+    return not host_is_local(PUBLIC_URL)
 
 
 def embed_image_ref(key: str) -> str:
@@ -952,6 +1004,145 @@ def image_attachment(key: str, data: bytes) -> Optional[discord.File]:
     if public_url_is_public():
         return None
     return discord.File(io.BytesIO(data), filename=f"{_safe_key(key)}.png")
+
+
+def public_download_url(token: str) -> Optional[str]:
+    """Link HTTP do paczki — TYLKO gdy PUBLIC_URL jest publiczny (localhost = None)."""
+    return f"{PUBLIC_URL}/download/{token}" if public_url_is_public() else None
+
+
+def public_preview_url(token: Optional[str]) -> Optional[str]:
+    """Link HTTP do podglądu — TYLKO gdy PUBLIC_URL jest publiczny (localhost = None)."""
+    if not token or not public_url_is_public():
+        return None
+    return f"{PUBLIC_URL}/preview/{token}"
+
+
+def preview_attachment(token: Optional[str]) -> Optional[discord.File]:
+    """Podgląd kombinacji jako plik HTML (gdy nie ma publicznego URL-a)."""
+    if not token or public_url_is_public():
+        return None
+    preview = STORAGE.get_preview(token)
+    if not preview:
+        return None
+    data = io.BytesIO(str(preview.get("html") or "").encode("utf-8"))
+    return discord.File(data, filename=f"podglad-{token[:8]}.html")
+
+
+def split_package_for_discord(zip_path: Path, limit_bytes: int) -> List[Path]:
+    """
+    Dzieli paczkę na części mieszczące się w limicie załącznika Discorda.
+
+    Każda część to osobny ZIP z tymi samymi ścieżkami w środku, więc po wypakowaniu
+    wszystkich części do jednego folderu powstaje komplet. Gdy paczka mieści się
+    w limicie — zwraca oryginał (bez kopiowania).
+    """
+    zip_path = Path(zip_path)
+    try:
+        if zip_path.stat().st_size <= limit_bytes:
+            return [zip_path]
+    except OSError as exc:
+        fp_log.warning("Brak paczki do wyslania (%s): %s", zip_path, exc)
+        return []
+    parts: List[Path] = []
+    try:
+        with zipfile.ZipFile(zip_path) as source:
+            groups: List[List[zipfile.ZipInfo]] = []
+            current: List[zipfile.ZipInfo] = []
+            current_size = 0
+            for info in source.infolist():
+                if info.is_dir():
+                    continue
+                entry_size = max(int(info.compress_size or 0), 1)
+                if current and current_size + entry_size > limit_bytes:
+                    groups.append(current)
+                    current, current_size = [], 0
+                current.append(info)
+                current_size += entry_size
+            if current:
+                groups.append(current)
+            total = len(groups)
+            for number, group in enumerate(groups, start=1):
+                part = zip_path.with_name(
+                    f"{zip_path.stem}-czesc{number}z{total}{zip_path.suffix}")
+                with zipfile.ZipFile(part, "w", zipfile.ZIP_DEFLATED) as target:
+                    for info in group:
+                        target.writestr(info, source.read(info.filename))
+                parts.append(part)
+    except (OSError, zipfile.BadZipFile) as exc:
+        fp_log.warning("Nie podzielono paczki %s: %s", zip_path.name, exc)
+        return []
+    return parts
+
+
+def delivery_header_lines(file_name: str, size_bytes: int, file_count: int, build_name: str,
+                          link: Optional[str], ttl_minutes: int) -> List[str]:
+    """Nagłówek wiadomości z paczką: link HTTP albo informacja o załączniku."""
+    if link:
+        lines = [f"**Pobierz:** [{file_name}]({link})", "",
+                 f"🕒 Link ważny: **{ttl_minutes} minut** "
+                 "(potem uruchom paczkę jeszcze raz przyciskiem 📦 Zakończ)."]
+    else:
+        lines = ["📎 **Paczka leci w załączniku poniżej** — zapisz plik i rozpakuj.",
+                 "💡 Stały link do pobrania pojawi się, gdy ustawisz `PUBLIC_URL` na publiczny "
+                 "adres bota (Render/Railway nadają go same — szczegóły w START-TUTAJ.txt)."]
+    lines += [
+        "",
+        f"📦 Rozmiar: **{size_bytes / 1024 / 1024:.2f} MB**",
+        f"📁 Plików: {file_count}",
+        f"🎮 Build: **{build_name}**",
+        "",
+        "**Instalacja:** rozpakuj i postępuj według `INSTRUKCJA.txt` "
+        "(w paczce też `manifest.json` i `HASHES.txt`).",
+    ]
+    return lines
+
+
+async def send_package_attachments(channel: Optional[discord.abc.Messageable], zip_path: Path,
+                                   *, preview_token: Optional[str] = None) -> bool:
+    """
+    Wysyła paczkę jako załącznik(i) Discorda — pobieranie działa bez publicznego URL-a.
+
+    Paczki większe niż limit Discorda są dzielone na części i wysyłane partiami po 10
+    plików; podgląd kombinacji (HTML) leci razem z pierwszą partią.
+    """
+    if channel is None:
+        return False
+    parts = await asyncio.to_thread(split_package_for_discord,
+                                    Path(zip_path), DISCORD_ATTACH_BYTES)
+    parts = [Path(p) for p in parts if Path(p).exists()]
+    if not parts:
+        return False
+    note = ("📦 **Twoja paczka** — zapisz plik z załącznika i rozpakuj."
+            if len(parts) == 1 else
+            f"📦 **Twoja paczka w {len(parts)} częściach** — pobierz **wszystkie** i wypakuj "
+            "do tego samego folderu (np. `Z:\\FiveM`). Kolejność nie ma znaczenia.")
+    preview = preview_attachment(preview_token)
+    if preview is not None:
+        note += "\n🖼️ Podgląd kombinacji: otwórz dołączony plik HTML w przeglądarce."
+    sent = 0
+    for start in range(0, len(parts), DISCORD_MAX_ATTACHMENTS):
+        batch = parts[start:start + DISCORD_MAX_ATTACHMENTS]
+        files: List[discord.File] = []
+        try:
+            files = [discord.File(p, filename=p.name) for p in batch]
+            if start == 0 and preview is not None:
+                files.append(preview)
+            await channel.send(content=note if start == 0 else None, files=files)
+            sent += len(batch)
+        except discord.HTTPException as exc:
+            fp_log.error("Nie wyslano czesci paczki jako zalacznika: %s", exc)
+            break
+        except OSError as exc:
+            fp_log.error("Blad pliku przy wysylce paczki: %s", exc)
+            break
+        finally:
+            for handle in files:
+                try:
+                    handle.close()
+                except Exception:  # noqa: BLE001 — zamknięcie nie może wywalić wysyłki
+                    pass
+    return sent > 0 and sent >= len(parts)
 
 
 def item_image_data_uri(item: Dict[str, Any]) -> str:
@@ -3083,20 +3274,13 @@ async def deliver_package(interaction: discord.Interaction, session: Session,
 
     token = STORAGE.register(result["zip_path"], result["zip_path"].name, result["size"],
                              result["file_count"], session.user_id, workspace=session.workspace)
-    link = f"{PUBLIC_URL}/download/{token}"
+    link = public_download_url(token)
+    attach_package = link is None      # brak publicznego URL-a → wysyłka załącznikiem
     session.delivered_at = time.time()
 
-    lines = [
-        f"**Pobierz:** [{result['zip_path'].name}]({link})",
-        "",
-        f"📦 Rozmiar: **{result['size'] / 1024 / 1024:.2f} MB**",
-        f"📁 Plików: {result['file_count']}",
-        f"🎮 Build: **{build['name']}**",
-        f"🕒 Link ważny: **{DOWNLOAD_TTL_MINUTES} minut**",
-        "",
-        "**Instalacja:** rozpakuj i postępuj według `INSTRUKCJA.txt` "
-        "(w paczce też `manifest.json` i `HASHES.txt`).",
-    ]
+    lines = delivery_header_lines(result["zip_path"].name, result["size"],
+                                  result["file_count"], build["name"], link,
+                                  DOWNLOAD_TTL_MINUTES)
     if conflicts:
         lines += ["", f"⚠️ Auto-rozwiązano **{len(conflicts)}** konflikt(ów) plików."]
 
@@ -3117,8 +3301,11 @@ async def deliver_package(interaction: discord.Interaction, session: Session,
     if not skipped and not warnings and not fixes:
         lines += ["", "🩺 Walidacja anty-crash: **wszystkie pliki OK** ✅"]
 
-    if session.preview_token:
-        lines += ["", f"🖼️ [Podgląd kombinacji]({PUBLIC_URL}/preview/{session.preview_token})"]
+    preview_link = public_preview_url(session.preview_token)
+    if preview_link:
+        lines += ["", f"🖼️ [Podgląd kombinacji]({preview_link})"]
+    elif session.preview_token:
+        lines += ["", "🖼️ Podgląd kombinacji — plik HTML w załączniku."]
     if result.get("pack_token"):
         lines += ["", f"🎫 **Twój token paczki:** `{result['pack_token']}` — "
                       "unikalny podpis tej paczki (możesz podać go administracji serwera)."]
@@ -3131,6 +3318,22 @@ async def deliver_package(interaction: discord.Interaction, session: Session,
         embed.set_footer(text=(f"Wygenerowano dla {profile.username or profile.user_id} • "
                                f"{profile.rank['name']} (poziom {profile.level})"))
     await interaction.followup.send(embed=embed)
+
+    # Bez publicznego URL-a paczkę wysyłamy załącznikiem — pobieranie musi działać
+    # także na localhostcie (np. bot na VPS bez domeny albo w trakcie testów).
+    if attach_package:
+        if await send_package_attachments(interaction.channel, result["zip_path"],
+                                          preview_token=session.preview_token):
+            STORAGE.mark_downloaded(token)   # dysk zwolni się szybciej (GC po pobraniu)
+        else:
+            fp_log.error("Paczki %s nie wyslano jako zalacznika", result["zip_path"].name)
+            try:
+                await interaction.channel.send(
+                    "⚠️ Nie udało się wysłać paczki jako załącznika Discorda. "
+                    "Paczka czeka na serwerze bota — poproś administrację "
+                    f"(`{result['zip_path'].name}`).")
+            except discord.HTTPException:
+                pass
 
     # --- Creator Economy: XP, odznaki, preferencje, historia ---
     if profile is not None:
@@ -3189,7 +3392,10 @@ async def deliver_package(interaction: discord.Interaction, session: Session,
     downloads_channel = discord.utils.get(guild.text_channels, name=CH_DOWNLOADS)
     if downloads_channel:
         try:
-            await downloads_channel.send(f"<@{session.user_id}> Twoja paczka: {link}")
+            await downloads_channel.send(
+                f"<@{session.user_id}> Twoja paczka: {link}" if link else
+                f"<@{session.user_id}> paczka `{result['zip_path'].name}` została wysłana "
+                "na kanał sesji jako załącznik.")
         except discord.HTTPException:
             pass
 
@@ -3833,7 +4039,7 @@ def publish_citizen_preview(session: Session, conflicts: Sequence[Dict[str, Any]
         return None
     page = render_preview_html(items, conflicts, build_by_id(session.build_id)["name"], "Podgląd citizena")
     session.preview_token = STORAGE.register_preview(page, "Podgląd citizena", session.user_id)
-    return f"{PUBLIC_URL}/preview/{session.preview_token}"
+    return public_preview_url(session.preview_token)
 
 
 def publish_skins_preview(session: Session, skins: Sequence[Dict[str, Any]]) -> Optional[str]:
@@ -3842,7 +4048,7 @@ def publish_skins_preview(session: Session, skins: Sequence[Dict[str, Any]]) -> 
         return None
     page = render_preview_html(skins, [], build_by_id(session.build_id)["name"], "Podgląd skinów broni")
     session.preview_token = STORAGE.register_preview(page, "Podgląd skinów", session.user_id)
-    return f"{PUBLIC_URL}/preview/{session.preview_token}"
+    return public_preview_url(session.preview_token)
 
 # ============================================================================
 # 18b. WŁASNE PLIKI GRACZA (📎) — bez hostingu, prosto z Discorda
@@ -4117,6 +4323,10 @@ async def send_summary(channel: discord.abc.Messageable, session: Session) -> No
     if link:
         embed.add_field(name="🖼️ Podgląd kombinacji (live)",
                         value=f"[Otwórz podgląd w przeglądarce]({link})\nZobacz dokładnie, co wchodzi do paczki.")
+    else:
+        embed.add_field(name="🖼️ Podgląd kombinacji",
+                        value="Plik HTML z podglądem dokładnie tej kombinacji dołączymy "
+                              "do gotowej paczki (brak publicznego `PUBLIC_URL`).")
     pozycje = len(session.choices) + len(session.collect_skins()) + len(session.uploads)
     rows: List[Any] = [[
         btn("citizen_finish", f"📦 Zbuduj paczkę ({pozycje})", discord.ButtonStyle.success),
@@ -4395,6 +4605,10 @@ async def send_skins_summary(channel: discord.abc.Messageable, session: Session)
     if link:
         embed.add_field(name="🖼️ Podgląd kombinacji (live)",
                         value=f"[Otwórz podgląd w przeglądarce]({link})")
+    else:
+        embed.add_field(name="🖼️ Podgląd kombinacji",
+                        value="Plik HTML z podglądem dołączymy do gotowej paczki "
+                              "(brak publicznego `PUBLIC_URL`).")
     embed.set_footer(text="Kliknij „Zakończ i zbuduj paczkę”, aby wygenerować ZIP.")
     await channel.send(embed=embed, view=LayoutView(*skin_nav_row()))
 
@@ -5244,7 +5458,13 @@ async def http_download(request: web.Request) -> web.StreamResponse:
     token = request.match_info["token"]
     package = STORAGE.get(token)
     if not package:
-        return web.Response(text="404: Paczka nie istnieje lub wygasła.", status=404)
+        return web.Response(text="404: Paczka nie istnieje lub wygasła — "
+                                 "uruchom paczkę jeszcze raz w bocie.", status=404)
+    if not Path(package["file_path"]).is_file():
+        STORAGE.remove(token, "brak pliku na dysku")
+        http_log.warning("Link %s wskazuje plik, ktorego juz nie ma (wyczyszczony dysk).", token[:8])
+        return web.Response(text="410: Paczka została już usunięta z serwera — "
+                                 "uruchom paczkę jeszcze raz w bocie.", status=410)
     STORAGE.mark_downloaded(token)
     http_log.info("Paczka %s pobierana przez HTTP (%s)", package["file_name"],
                   request.remote or "?")
@@ -5737,7 +5957,14 @@ class FoundryBot(discord.Client):
         self.http_runner = web.AppRunner(create_http_app())
         await self.http_runner.setup()
         await web.TCPSite(self.http_runner, "0.0.0.0", HTTP_PORT).start()
-        http_log.info("Serwer HTTP na porcie %s (linki: %s/download/<token>)", HTTP_PORT, PUBLIC_URL)
+        http_log.info("Serwer HTTP na porcie %s (adres: %s, zrodlo: %s)",
+                      HTTP_PORT, PUBLIC_URL, PUBLIC_URL_SOURCE)
+        if not public_url_is_public():
+            http_log.warning(
+                "Adres publiczny to '%s' — linki /download/ i /preview/ nie zadziałają "
+                "u graczy, więc paczki i podglądy polecą jako załączniki Discorda. "
+                "Ustaw PUBLIC_URL na publiczny adres bota, aby działały zwykłe linki.",
+                PUBLIC_URL)
 
         # 2. Komendy slash
         try:
@@ -6340,7 +6567,8 @@ async def create_ticket(interaction: discord.Interaction, start_mode: str) -> No
                         else "🛠️ Tryb **Citizen Foundry** aktywny — poniżej menu.") +
                      "\n\n🛠️ **Citizen** — 24 opcje w 6 grupach (niebo, woda, cienie, pojazdy, potato, kombat)\n"
                      "🔫 **Skiny broni** — kategorie, galeria, wyszukiwarka .rpf\n"
-                     "🖼️ **Podgląd kombinacji** — link do strony z Twoimi wyborami\n"
+                     "🖼️ **Podgląd kombinacji** — strona z Twoimi wyborami "
+                     "(a gdy brak publicznego adresu — plik HTML przy paczce)\n"
                      f"🎮 **Build paczki:** {build_by_id(session.build_id)['name']}\n\n"
                      f"Przerwij: `/zamknij` lub przycisk 🔒 (auto-zamknięcie po "
                      f"{CHANNEL_CLEANUP_MINUTES} min od wygenerowania paczki)."),
@@ -6374,8 +6602,11 @@ async def handle_build_pick(interaction: discord.Interaction, session: Session,
         kept, _dropped, _conflicts = resolve_conflicts(session.chosen_steps())
         page = render_preview_html(kept, conflicts, build["name"], "Podgląd citizena")
         session.preview_token = STORAGE.register_preview(page, "Podgląd citizena", session.user_id)
+        preview_live = public_preview_url(session.preview_token)
         embed.add_field(name="🖼️ Podgląd kombinacji (live)",
-                        value=f"[Otwórz podgląd w przeglądarce]({PUBLIC_URL}/preview/{session.preview_token})")
+                        value=(f"[Otwórz podgląd w przeglądarce]({preview_live})" if preview_live
+                               else "Plik HTML dołączymy do gotowej paczki "
+                                    "(brak publicznego `PUBLIC_URL`)."))
         await interaction.response.edit_message(embed=embed, view=LayoutView(
             [btn("citizen_finish", "Zakończ tworzenie", discord.ButtonStyle.success, "📦"),
              btn("citizen_restart", "Zacznij od nowa", discord.ButtonStyle.secondary, "🔄"),
@@ -6401,6 +6632,9 @@ async def handle_build_pick(interaction: discord.Interaction, session: Session,
         link = publish_skins_preview(session, list(skins) + uploads)
         if link:
             embed.add_field(name="🖼️ Podgląd kombinacji (live)", value=f"[Otwórz podgląd]({link})")
+        else:
+            embed.add_field(name="🖼️ Podgląd kombinacji",
+                            value="Plik HTML dołączymy do gotowej paczki.")
         await interaction.response.edit_message(embed=embed, view=LayoutView(*skin_nav_row()))
         return
 
@@ -7386,8 +7620,14 @@ def main() -> None:
 
     if not YOUTUBE_API_KEY:
         core_log.warning("Brak YOUTUBE_API_KEY — live feed YouTube nieaktywny.")
-    if not os.getenv("PUBLIC_URL"):
-        core_log.warning("Brak PUBLIC_URL — linki do paczek wskażą localhost!")
+    if public_url_is_public():
+        core_log.info("Adres publiczny bota: %s (źródło: %s)", PUBLIC_URL, PUBLIC_URL_SOURCE)
+    else:
+        core_log.warning(
+            "PUBLIC_URL = %s wskazuje localhost — linki /download/ i /preview/ nie zadziałają "
+            "u graczy. Paczki i podglądy będą wysyłane jako załączniki Discorda "
+            "(fallback działa od razu). Ustaw PUBLIC_URL na publiczny adres bota, np. "
+            "https://twoj-bot.onrender.com — szczegóły w START-TUTAJ.txt.", PUBLIC_URL)
     if not SKIN_INDEX_URL or "twoj-user" in SKIN_INDEX_URL:
         core_log.warning("Brak SKIN_INDEX_URL — wyszukiwarka skinów .rpf będzie pusta.")
 
