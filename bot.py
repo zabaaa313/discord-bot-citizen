@@ -3695,6 +3695,112 @@ async def system_log(guild: discord.Guild, action: str, executor: discord.abc.Us
         sys_log.error("Nie zapisano loga systemowego: %s", exc)
 
 
+# ============================================================================
+# 21.4.1. OSTATNIA OPERACJA /SYSTEM — raport do odzyskania jednym klikiem
+#   Długie akcje /system (design, reset, Ghost Copy) mogą zakończyć się już po
+#   zniknięciu kanału, z którego je uruchomiono (Discord: 400/10003 Unknown
+#   Channel) — wtedy admin nie widzi wyniku. Dlatego każdą operację zapisujemy
+#   w data/system_last_op.json: przycisk 🔁 pokaże raport, a ↻ Ponów powtórzy
+#   akcję bez szukania po logach.
+# ============================================================================
+
+sys_op_log = log("SysOps")
+SYS_OP_FILE = DATA_DIR / "system_last_op.json"
+LAST_SYS_OPS: Dict[str, Dict[str, Any]] = {}
+
+SYS_OP_LABELS = {
+    "build_design": "🎨 Zbuduj estetyczny design",
+    "reset": "⚠️ Reset serwera",
+    "apply_template": "👻 Zastosuj szablon",
+    "clone_guild": "👻 Klon z innego serwera",
+}
+
+
+def sys_ops_load() -> None:
+    """Wczytuje raporty operacji /system (odporne na brak i uszkodzony plik)."""
+    LAST_SYS_OPS.clear()
+    try:
+        raw = json.loads(SYS_OP_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if isinstance(raw, dict):
+        for guild_id, record in raw.items():
+            if isinstance(record, dict) and record.get("action"):
+                LAST_SYS_OPS[str(guild_id)] = record
+
+
+def sys_ops_save() -> None:
+    """Zapisuje raporty na dysk — błąd zapisu tylko logujemy."""
+    try:
+        SYS_OP_FILE.write_text(json.dumps(LAST_SYS_OPS, indent=2, ensure_ascii=False),
+                               encoding="utf-8")
+    except OSError as exc:
+        sys_op_log.warning("Nie zapisano historii operacji /system: %s", exc)
+
+
+def sys_op_record(guild_id: Optional[int], action: str, *, ok: bool, headline: str,
+                  detail: str = "", user_id: Optional[int] = None,
+                  extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Zapisuje wynik ostatniej operacji /system na danym serwerze."""
+    record = {
+        "action": action,
+        "label": SYS_OP_LABELS.get(action, action),
+        "ok": bool(ok),
+        "headline": str(headline)[:300],
+        "detail": str(detail)[:4000],
+        "user_id": int(user_id) if user_id else None,
+        "at": int(time.time()),
+        "extra": dict(extra or {}),
+    }
+    if guild_id is not None:
+        LAST_SYS_OPS[str(guild_id)] = record
+        sys_ops_save()
+    sys_op_log.info("[%s] %s (%s)", action, record["headline"], "ok" if ok else "błąd")
+    return record
+
+
+def sys_op_last(guild_id: Optional[int]) -> Optional[Dict[str, Any]]:
+    """Raport ostatniej operacji /system na serwerze (albo None)."""
+    if guild_id is None:
+        return None
+    return LAST_SYS_OPS.get(str(guild_id))
+
+
+def sys_op_embed(record: Dict[str, Any]) -> discord.Embed:
+    """Embed z raportem operacji — do pokazania po fakcie (np. gdy kanał zniknął)."""
+    when = int(record.get("at") or 0)
+    lines = [line for line in str(record.get("detail") or "").splitlines() if line.strip()]
+    embed = discord.Embed(
+        title=f"{'✅' if record.get('ok') else '❌'} {record.get('label') or 'Operacja /system'}",
+        description=(f"**Status:** {'zakończona' if record.get('ok') else 'przerwana'}\n"
+                     f"**Wynik:** {record.get('headline') or '—'}\n"
+                     f"**Kiedy:** <t:{when}:F> (<t:{when}:R>)"
+                     + (f"\n**Wykonał:** <@{record['user_id']}>" if record.get("user_id") else "")),
+        color=C_GREEN if record.get("ok") else C_RED,
+        timestamp=datetime.now(timezone.utc))
+    if lines:
+        text = "\n".join(lines[:20])
+        if len(lines) > 20:
+            text += f"\n... i {len(lines) - 20} więcej"
+        embed.add_field(name="Szczegóły", value=f"```\n{text[:1000]}\n```", inline=False)
+    embed.set_footer(text=(f"Kanał zniknął? Raport masz tutaj i w #{CH_SYSLOG} — "
+                           "przycisk ↻ Ponów powtórzy operację."))
+    return embed
+
+
+def sys_op_view(record: Optional[Dict[str, Any]] = None) -> discord.ui.View:
+    """Przyciski raportu: ponowienie operacji + odświeżenie raportu."""
+    record = record or {}
+    buttons = [btn("sys_last_op", "Odśwież raport", discord.ButtonStyle.secondary, "🔄")]
+    if record.get("action"):
+        buttons.insert(0, btn("sys_repeat_last", "Ponów operację",
+                              discord.ButtonStyle.primary, "↻"))
+    return LayoutView(buttons)
+
+
+sys_ops_load()
+
+
 def is_authorized(interaction: discord.Interaction) -> bool:
     """Dostęp do /system: właściciel serwera albo Administrator."""
     if not interaction.guild:
@@ -3765,8 +3871,15 @@ async def build_aesthetic_design(guild: discord.Guild, executor: discord.abc.Use
     return results
 
 
-async def reset_server(guild: discord.Guild, executor: discord.abc.User) -> List[str]:
-    """Usuwa strukturę stworzoną przez bota (kategorie, kanały emotkowe, role)."""
+async def reset_server(guild: discord.Guild, executor: discord.abc.User,
+                       keep_channel_id: Optional[int] = None) -> List[str]:
+    """
+    Usuwa strukturę stworzoną przez bota (kategorie, kanały emotkowe, role).
+
+    `keep_channel_id` to kanał, z którego uruchomiono reset — nie kasujemy go,
+    żeby bot miał gdzie wysłać podsumowanie (inaczej Discord zwraca
+    400/10003 Unknown Channel i admin nie widzi wyniku operacji).
+    """
     results: List[str] = []
     categories_to_remove = [
         CAT_INFO, CAT_CITIZEN, CAT_TICKETS, CAT_SKINS, CAT_MODS,
@@ -3777,6 +3890,9 @@ async def reset_server(guild: discord.Guild, executor: discord.abc.User) -> List
         if not category:
             continue
         for channel in list(category.channels):
+            if keep_channel_id and channel.id == keep_channel_id:
+                results.append(f"= zachowano kanał {channel.name} (tu kliknięto reset)")
+                continue
             try:
                 await channel.delete(reason="Reset serwera (/system)")
             except discord.HTTPException:
@@ -3789,6 +3905,8 @@ async def reset_server(guild: discord.Guild, executor: discord.abc.User) -> List
 
     emoji_pattern = re.compile(r"^[^\w\s]+・")
     for channel in list(guild.text_channels):
+        if keep_channel_id and channel.id == keep_channel_id:
+            continue
         if emoji_pattern.match(channel.name):
             try:
                 await channel.delete(reason="Reset serwera (/system)")
@@ -4039,6 +4157,12 @@ def ghost_report_embed(title: str, report: Dict[str, Any]) -> discord.Embed:
 def system_panel_embed(guild: discord.Guild, executor: discord.abc.User) -> discord.Embed:
     """Embed panelu /system."""
     templates = template_list()
+    last = sys_op_last(getattr(guild, "id", None))
+    if last:
+        last_line = (f"🕒 **Ostatnia operacja:** {last.get('label')} — "
+                     f"{'✅' if last.get('ok') else '❌'} <t:{int(last.get('at') or 0)}:R>\n\n")
+    else:
+        last_line = "🕒 **Ostatnia operacja:** brak\n\n"
     return discord.Embed(
         title="⚙️ Panel Systemowy — Zarządzanie serwerem",
         description=(f"**Serwer:** {guild.name}\n"
@@ -4046,10 +4170,13 @@ def system_panel_embed(guild: discord.Guild, executor: discord.abc.User) -> disc
                      "**Dostępne akcje:**\n"
                      "🎨 **Zbuduj design** — estetyczna przebudowa układu (emotki, kategorie, uprawnienia).\n"
                      "👻 **Ghost Copy** — zapisz/sklonuj całą strukturę (role, kanały, uprawnienia).\n"
-                     "⚠️ **Reset serwera** — usuwa strukturę bota (podwójne potwierdzenie!).\n\n"
+                     "⚠️ **Reset serwera** — usuwa strukturę bota (podwójne potwierdzenie!).\n"
+                     "🔁 **Ostatnia operacja** — raport ostatniej akcji + ponowienie jednym klikiem\n"
+                     "  (ratunek, gdy kanał zniknął w trakcie operacji).\n\n"
                      f"📁 **Szablony Ghost Copy:** {len(templates)} "
                      + (f"({', '.join(templates[:5])})" if templates else "*(brak — zapisz pierwszy przyciskiem 💾)*")
-                     + "\n\n**Zabezpieczenia:** tylko właściciel serwera lub Administrator.\n"
+                     + "\n\n" + last_line
+                     + "**Zabezpieczenia:** tylko właściciel serwera lub Administrator.\n"
                      f"Każde użycie logowane do `#{CH_SYSLOG}`."),
         color=C_PURPLE, timestamp=datetime.now(timezone.utc))
 
@@ -4061,7 +4188,8 @@ def system_panel_view(templates: Optional[Sequence[str]] = None) -> discord.ui.V
          btn("sys_reset_start", "Wyczyść / Resetuj serwer", discord.ButtonStyle.danger, "⚠️"),
          btn("sys_refresh", "Odśwież panel", discord.ButtonStyle.secondary, "🔄")],
         [btn("sys_template_save", "Zapisz szablon", discord.ButtonStyle.secondary, "💾"),
-         btn("sys_clone_from", "Sklonuj z innego serwera", discord.ButtonStyle.primary, "👻")],
+         btn("sys_clone_from", "Sklonuj z innego serwera", discord.ButtonStyle.primary, "👻"),
+         btn("sys_last_op", "Ostatnia operacja", discord.ButtonStyle.secondary, "🔁")],
     ]
     names = list(templates if templates is not None else template_list())[:24]
     if names:
@@ -4416,6 +4544,141 @@ async def notify_admin(title: str, detail: str = "", color: int = C_BLUE) -> Non
     await _deliver_admin_embed(embed)
 
 
+# ---------------------------------------------------------------------------
+# 22.5.1. BEZPIECZNE WYSYŁANIE ODPOWIEDZI (Unknown Channel / wygasły token)
+#   Discord zwraca 400/10003 "Unknown Channel", gdy kanał, z którego kliknięto
+#   przycisk, przestał istnieć w trakcie długiej operacji (reset/design usuwa
+#   kanały, drugi admin może skasować kanał równolegle). Wysyłka nie może wtedy
+#   wywalić handlera — inaczej jeden klik generuje drugie zgłoszenie błędu
+#   ("During handling of the above exception...") zamiast czytelnej informacji.
+#   Dodatkowo, gdy kanał zniknął, wynik leci na priv autora akcji,
+#   a jeśli priv jest zamknięty — na kanał #logi-system.
+# ---------------------------------------------------------------------------
+
+GONE_CHANNEL_CODES = {10003, 10013}
+
+
+def _is_channel_gone_error(exc: BaseException) -> bool:
+    """Czy wyjątek Discorda oznacza 'kanał już nie istnieje'?"""
+    if getattr(exc, "code", None) in GONE_CHANNEL_CODES:
+        return True
+    text = f"{type(exc).__name__} {exc}".lower()
+    return "unknown channel" in text or "unknown channel" in str(getattr(exc, "text", "")).lower()
+
+
+def interaction_channel_gone(interaction: discord.Interaction) -> bool:
+    """True, gdy kanał interakcji zniknął z serwera (bot go już nie widzi)."""
+    guild = getattr(interaction, "guild", None)
+    channel_id = getattr(interaction, "channel_id", None)
+    getter = getattr(guild, "get_channel_or_thread", None)
+    if guild is None or not channel_id or getter is None:
+        return False
+    return getter(channel_id) is None
+
+
+async def _deliver_fallback(interaction: discord.Interaction, *, content: Optional[str] = None,
+                           embed: Optional[discord.Embed] = None, view: Any = None,
+                           where: str = "interakcja") -> None:
+    """Awaryjna dostawa wyniku: priv autora akcji, a potem kanał #logi-system."""
+    note = ("ℹ️ Kanał, na którym klikałeś, zniknął albo odpowiedź nie mogła do niego dotrzeć — "
+            "wynik wysyłam tutaj. Pełny log jest w `#" + CH_SYSLOG + "`, a raport ostatniej "
+            "operacji odzyskasz przyciskiem 🔁 w `/system`.")
+    body = f"{content}\n\n{note}" if content else note
+
+    user = getattr(interaction, "user", None)
+    if user is not None:
+        try:
+            await user.send(content=body, embed=embed, view=view)
+            return
+        except discord.HTTPException as exc:
+            sys_log.warning("Fallback na priv nie dotarł (%s): %s", where, exc)
+
+    guild = getattr(interaction, "guild", None)
+    if guild is not None:
+        try:
+            channel = await get_admin_log_channel(guild)
+            if channel:
+                await channel.send(content=body, embed=embed)
+        except Exception as exc:  # noqa: BLE001
+            sys_log.warning("Fallback na #%s nieudany (%s): %s", CH_SYSLOG, where, exc)
+
+
+async def safe_reply(interaction: discord.Interaction, *, content: Optional[str] = None,
+                     embed: Optional[discord.Embed] = None, view: Any = None,
+                     ephemeral: bool = True, where: str = "interakcja") -> bool:
+    """
+    Odpowiada na interakcję tak, by awaria wysyłki nie przerwała handlera.
+
+    1. Najpierw normalna odpowiedź (`response` → `followup`).
+    2. Gdy kanał/kanał docelowy zniknął (10003), wynik idzie fallbackiem
+       (`_deliver_fallback`), więc użytkownik NIE zostaje bez informacji.
+    3. Nigdy nie podnosi wyjątku — zwraca True (wysłano) / False (fallback).
+    """
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(content=content, embed=embed, view=view,
+                                            ephemeral=ephemeral)
+        else:
+            await interaction.response.send_message(content=content, embed=embed, view=view,
+                                                    ephemeral=ephemeral)
+        return True
+    except discord.InteractionResponded:
+        try:
+            await interaction.followup.send(content=content, embed=embed, view=view,
+                                            ephemeral=ephemeral)
+            return True
+        except discord.HTTPException as exc:
+            sys_log.warning("Nie wysłano odpowiedzi (%s): %s", where, exc)
+    except discord.HTTPException as exc:
+        if _is_channel_gone_error(exc):
+            sys_log.warning("Odpowiedź (%s) nie dotarła — kanał już nie istnieje: %s", where, exc)
+        else:
+            sys_log.warning("Nie wysłano odpowiedzi (%s): %s", where, exc)
+    except Exception as exc:  # noqa: BLE001
+        sys_log.warning("Nie wysłano odpowiedzi (%s): %s", where, exc)
+
+    await _deliver_fallback(interaction, content=content, embed=embed, view=view, where=where)
+    return False
+
+
+async def safe_defer(interaction: discord.Interaction, *, ephemeral: bool = True,
+                     thinking: bool = False, where: str = "interakcja") -> bool:
+    """`response.defer()` odporne na podwójne kliknięcie i na zniknięcie kanału."""
+    try:
+        await interaction.response.defer(ephemeral=ephemeral, thinking=thinking)
+        return True
+    except discord.InteractionResponded:
+        return True
+    except discord.HTTPException as exc:
+        if _is_channel_gone_error(exc):
+            sys_log.warning("defer (%s) — kanał już nie istnieje: %s", where, exc)
+        else:
+            sys_log.warning("defer (%s) nieudany: %s", where, exc)
+        return False
+    except Exception as exc:  # noqa: BLE001
+        sys_log.warning("defer (%s) nieudany: %s", where, exc)
+        return False
+
+
+async def safe_modal(interaction: discord.Interaction, modal: discord.ui.Modal,
+                     where: str = "interakcja") -> bool:
+    """Otwiera okno modalne; gdy się nie da, informuje autora akcji poza kanałem."""
+    try:
+        await interaction.response.send_modal(modal)
+        return True
+    except discord.InteractionResponded:
+        return True
+    except discord.HTTPException as exc:
+        sys_log.warning("Modal (%s) nie wysłany: %s", where, exc)
+    except Exception as exc:  # noqa: BLE001
+        sys_log.warning("Modal (%s) nie wysłany: %s", where, exc)
+    await _deliver_fallback(interaction,
+                            content="❌ Nie udało się otworzyć okna potwierdzenia. "
+                                    "Spróbuj ponownie z innego kanału.",
+                            where=where)
+    return False
+
+
 async def report_user_error(interaction: discord.Interaction, exc: BaseException, where: str) -> None:
     """Czytelny komunikat dla gracza + automatyczne zgłoszenie dla administracji."""
     eid = await notify_error(f"Błąd obsługi: {where}", f"Komenda/akcja: `{where}`", exc, where,
@@ -4423,13 +4686,8 @@ async def report_user_error(interaction: discord.Interaction, exc: BaseException
     message = (f"😔 **Ups, coś poszło nie tak** (`{where}`).\n"
                "Nic nie zostało zepsute — spróbuj ponownie lub kliknij przycisk raz jeszcze.\n"
                f"Jeśli problem wraca, zgłoś administracji kod błędu: `{eid}`")
-    try:
-        if interaction.response.is_done():
-            await interaction.followup.send(message, ephemeral=True)
-        else:
-            await interaction.response.send_message(message, ephemeral=True)
-    except discord.HTTPException:
-        pass
+    # safe_reply: brak kanału/perms już nie wywala obsługi błędu drugim wyjątkiem.
+    await safe_reply(interaction, content=message, ephemeral=True, where=where)
 
 
 def handle_loop_exception(loop: asyncio.AbstractEventLoop, context: Dict[str, Any]) -> None:
@@ -5163,18 +5421,18 @@ async def handle_ghost_save_modal(interaction: discord.Interaction) -> None:
     if not name:
         await interaction.response.send_message("❌ Podaj nazwę szablonu.", ephemeral=True)
         return
-    await interaction.response.defer(ephemeral=True)
+    await safe_defer(interaction, ephemeral=True, where="sys_save_modal")
     layout = export_guild_layout(interaction.guild)
     path = template_save(name, layout)
     await system_log(interaction.guild, "Ghost Copy — zapis szablonu", interaction.user,
                      f"{path.name}: {len(layout['roles'])} rol, {len(layout['categories'])} kategorii, "
                      f"{len(layout['channels'])} kanałów")
-    await interaction.followup.send(
+    await safe_reply(interaction, where="sys_save_modal", ephemeral=True, content=(
         f"💾 **Szablon zapisany:** `{path.stem}`\n"
         f"👥 Role: **{len(layout['roles'])}** • 🗂️ Kategorie: **{len(layout['categories'])}** "
         f"• 💬 Kanały: **{len(layout['channels'])}**\n\n"
         "Zastosuj go na innym serwerze przez `/ghost` → wybór z listy lub "
-        f"`/ghost akcja:klonuj serwer:<ID>`.", ephemeral=True)
+        f"`/ghost akcja:klonuj serwer:<ID>`."))
 
 
 def ghost_apply_modal(name: str, roles: int, channels: int) -> discord.ui.Modal:
@@ -5202,14 +5460,29 @@ async def handle_ghost_apply_modal(interaction: discord.Interaction, name: str) 
             f"❌ Potwierdzenie niepoprawne (`{typed}`) — musisz wpisać `{COPY_CONFIRM_WORD}`. "
             "Nic nie zmieniono.", ephemeral=True)
         return
-    await interaction.response.defer(ephemeral=True)
-    report = await apply_guild_layout(interaction.guild, layout,
-                                      reason=f"Ghost Copy z szablonu {name} ({interaction.user})")
-    await system_log(interaction.guild, "Ghost Copy — zastosowano szablon", interaction.user,
-                     f"{name}: +{len(report['roles'])} rol, +{len(report['categories'])} kategorii, "
-                     f"+{len(report['channels'])} kanałów, błędy: {len(report['errors'])}")
-    await interaction.followup.send(embed=ghost_report_embed(f"👻 Szablon `{name}` zastosowany", report),
-                                    ephemeral=True)
+    await safe_defer(interaction, ephemeral=True, where=f"sys_apply_modal:{name}")
+    try:
+        report = await apply_guild_layout(interaction.guild, layout,
+                                          reason=f"Ghost Copy z szablonu {name} ({interaction.user})")
+        sys_op_record(getattr(interaction, "guild_id", None), "apply_template", ok=True,
+                      headline=(f"Szablon `{name}`: +{len(report['roles'])} rol, "
+                                f"+{len(report['categories'])} kategorii, "
+                                f"+{len(report['channels'])} kanałów"),
+                      detail="\n".join(str(e) for e in (report.get("errors") or [])),
+                      user_id=interaction.user.id, extra={"template": name})
+        await system_log(interaction.guild, "Ghost Copy — zastosowano szablon", interaction.user,
+                         f"{name}: +{len(report['roles'])} rol, +{len(report['categories'])} kategorii, "
+                         f"+{len(report['channels'])} kanałów, błędy: {len(report['errors'])}")
+        await safe_reply(interaction, where=f"sys_apply_modal:{name}", ephemeral=True,
+                         embed=ghost_report_embed(f"👻 Szablon `{name}` zastosowany", report))
+    except Exception as exc:  # noqa: BLE001
+        sys_log.error("Blad Ghost Copy (szablon %s): %s", name, exc)
+        record = sys_op_record(getattr(interaction, "guild_id", None), "apply_template",
+                               ok=False, headline=f"Operacja przerwana: {exc}",
+                               detail=str(exc), user_id=interaction.user.id,
+                               extra={"template": name})
+        await safe_reply(interaction, where=f"sys_apply_modal:{name}", ephemeral=True,
+                         embed=sys_op_embed(record))
 
 
 def ghost_clone_modal() -> discord.ui.Modal:
@@ -5245,20 +5518,44 @@ async def handle_ghost_clone_modal(interaction: discord.Interaction) -> None:
     except ValueError:
         await interaction.response.send_message("❌ To nie wygląda na ID serwera.", ephemeral=True)
         return
-    await interaction.response.defer(ephemeral=True)
+    await safe_defer(interaction, ephemeral=True, where="sys_clone_modal")
     source = bot.get_guild(source_id)
     if source is None:
-        await interaction.followup.send(
+        await safe_reply(interaction, where="sys_clone_modal", ephemeral=True, content=(
             "❌ Bot nie jest na tym serwerze — dodaj go tam i spróbuj ponownie "
-            "(albo zapisz strukturę jako szablon tam, gdzie bot jest, i użyj `/ghost`).",
-            ephemeral=True)
+            "(albo zapisz strukturę jako szablon tam, gdzie bot jest, i użyj `/ghost`)."))
         return
-    report = await clone_guild_structure(source, interaction.guild, interaction.user, save_as)
-    await system_log(interaction.guild, "Ghost Copy — klon z innego serwera", interaction.user,
-                     f"źródło: {source.name} ({source.id}), +{len(report['roles'])} rol, "
-                     f"+{len(report['channels'])} kanałów")
-    await interaction.followup.send(
-        embed=ghost_report_embed(f"👻 Sklonowano strukturę z {source.name}", report), ephemeral=True)
+    try:
+        report = await clone_guild_structure(source, interaction.guild, interaction.user, save_as)
+        sys_op_record(getattr(interaction, "guild_id", None), "clone_guild", ok=True,
+                      headline=(f"Klon z {source.name} ({source.id}): "
+                                f"+{len(report['roles'])} rol, +{len(report['channels'])} kanałów"),
+                      detail="\n".join(str(e) for e in (report.get("errors") or [])),
+                      user_id=interaction.user.id,
+                      extra={"source": source.id, "save_as": save_as})
+        await system_log(interaction.guild, "Ghost Copy — klon z innego serwera", interaction.user,
+                         f"źródło: {source.name} ({source.id}), +{len(report['roles'])} rol, "
+                         f"+{len(report['channels'])} kanałów")
+        await safe_reply(interaction, where="sys_clone_modal", ephemeral=True,
+                         embed=ghost_report_embed(f"👻 Sklonowano strukturę z {source.name}", report))
+    except Exception as exc:  # noqa: BLE001
+        sys_log.error("Blad Ghost Copy (klon z %s): %s", source_id, exc)
+        record = sys_op_record(getattr(interaction, "guild_id", None), "clone_guild", ok=False,
+                               headline=f"Operacja przerwana: {exc}", detail=str(exc),
+                               user_id=interaction.user.id,
+                               extra={"source": source_id, "save_as": save_as})
+        await safe_reply(interaction, where="sys_clone_modal", ephemeral=True,
+                         embed=sys_op_embed(record))
+
+
+def reset_confirm_modal() -> discord.ui.Modal:
+    """Modal potwierdzenia resetu (wspólny dla ⚠️ Reset i ↻ Ponów operację)."""
+    modal = discord.ui.Modal(title="⚠️ Potwierdzenie resetu serwera", custom_id="sys_reset_modal")
+    modal.add_item(discord.ui.TextInput(
+        custom_id="sys_reset_text", label="Wpisz POTWIERDZAM wielkimi literami",
+        style=discord.TextStyle.short, min_length=11, max_length=11,
+        placeholder="POTWIERDZAM", required=True))
+    return modal
 
 
 async def handle_system_button(interaction: discord.Interaction, custom_id: str,
@@ -5271,17 +5568,23 @@ async def handle_system_button(interaction: discord.Interaction, custom_id: str,
         return
 
     if custom_id == "sys_refresh":
-        await interaction.response.edit_message(
-            embed=system_panel_embed(interaction.guild, interaction.user),
-            view=system_panel_view(template_list()))
+        embed = system_panel_embed(interaction.guild, interaction.user)
+        view = system_panel_view(template_list())
+        try:
+            await interaction.response.edit_message(embed=embed, view=view)
+        except discord.HTTPException as exc:
+            # np. wiadomość panelu już nie istnieje — wysyłamy panel od nowa
+            sys_log.warning("Odświeżenie panelu nieudane: %s", exc)
+            await safe_reply(interaction, embed=embed, view=view, ephemeral=True,
+                             where=custom_id)
         return
 
     if custom_id == "sys_template_save":
-        await interaction.response.send_modal(ghost_save_modal())
+        await safe_modal(interaction, ghost_save_modal(), where=custom_id)
         return
 
     if custom_id == "sys_clone_from":
-        await interaction.response.send_modal(ghost_clone_modal())
+        await safe_modal(interaction, ghost_clone_modal(), where=custom_id)
         return
 
     if custom_id == "sys_template_pick":
@@ -5291,26 +5594,22 @@ async def handle_system_button(interaction: discord.Interaction, custom_id: str,
         if not layout:
             await interaction.response.send_message("❌ Szablon nie istnieje.", ephemeral=True)
             return
-        await interaction.response.send_modal(
-            ghost_apply_modal(name, len(layout.get("roles") or []),
-                              len(layout.get("channels") or [])))
+        await safe_modal(interaction,
+                         ghost_apply_modal(name, len(layout.get("roles") or []),
+                                           len(layout.get("channels") or [])),
+                         where=custom_id)
         return
 
     if custom_id == "sys_build_design":
-        await interaction.response.defer(ephemeral=True)
-        try:
-            results = await build_aesthetic_design(interaction.guild, interaction.user)
-            embed = discord.Embed(
-                title="🎨 Design serwera przebudowany!",
-                description=(f"Wykonano **{len(results)}** operacji:\n```\n"
-                             + "\n".join(results[:20])
-                             + (f"\n... i {len(results) - 20} więcej" if len(results) > 20 else "")
-                             + "\n```\n\nPełny log w `#" + CH_SYSLOG + "`."),
-                color=C_GREEN, timestamp=datetime.now(timezone.utc))
-            await interaction.followup.send(embed=embed)
-        except Exception as exc:  # noqa: BLE001
-            sys_log.error("Blad budowania designu: %s", exc)
-            await interaction.followup.send(f"❌ Błąd: {exc}", ephemeral=True)
+        await run_design_build(interaction, custom_id)
+        return
+
+    if custom_id == "sys_last_op":
+        await handle_last_op(interaction)
+        return
+
+    if custom_id == "sys_repeat_last":
+        await handle_repeat_last(interaction)
         return
 
     if custom_id == "sys_reset_start":
@@ -5324,24 +5623,27 @@ async def handle_system_button(interaction: discord.Interaction, custom_id: str,
                          "**To NIE usuwa**: kanałów spoza listy ani własnych kanałów administracji.\n\n"
                          "**Aby potwierdzić, kliknij 🔴 Potwierdzam i wpisz `POTWIERDZAM`** w okienku."),
             color=C_RED)
-        await interaction.response.send_message(embed=embed, ephemeral=True, view=LayoutView([
-            btn("sys_reset_confirm", "Potwierdzam — chcę reset", discord.ButtonStyle.danger, "🔴"),
-            btn("sys_reset_cancel", "Anuluj", discord.ButtonStyle.secondary, "✖️"),
-        ]))
+        await safe_reply(interaction, embed=embed, ephemeral=True, where=custom_id,
+                         view=LayoutView([
+                             btn("sys_reset_confirm", "Potwierdzam — chcę reset",
+                                 discord.ButtonStyle.danger, "🔴"),
+                             btn("sys_reset_cancel", "Anuluj", discord.ButtonStyle.secondary, "✖️"),
+                         ]))
         return
 
     if custom_id == "sys_reset_cancel":
         await system_log(interaction.guild, "Reset anulowany przez użytkownika", interaction.user)
-        await interaction.response.edit_message(content="✖️ Reset anulowany.", embed=None, view=None)
+        try:
+            await interaction.response.edit_message(content="✖️ Reset anulowany.",
+                                                    embed=None, view=None)
+        except discord.HTTPException as exc:
+            sys_log.warning("Anulowanie resetu — nie edytowano wiadomości: %s", exc)
+            await safe_reply(interaction, content="✖️ Reset anulowany.", ephemeral=True,
+                             where=custom_id)
         return
 
     if custom_id == "sys_reset_confirm":
-        modal = discord.ui.Modal(title="⚠️ Potwierdzenie resetu serwera", custom_id="sys_reset_modal")
-        modal.add_item(discord.ui.TextInput(
-            custom_id="sys_reset_text", label="Wpisz POTWIERDZAM wielkimi literami",
-            style=discord.TextStyle.short, min_length=11, max_length=11,
-            placeholder="POTWIERDZAM", required=True))
-        await interaction.response.send_modal(modal)
+        await safe_modal(interaction, reset_confirm_modal(), where=custom_id)
         return
 
 
@@ -5355,20 +5657,111 @@ async def handle_reset_modal(interaction: discord.Interaction) -> None:
         await interaction.response.send_message(
             f"❌ Niepoprawne potwierdzenie: `{typed}`. Reset anulowany.", ephemeral=True)
         return
-    await interaction.response.defer(ephemeral=True)
+    # Kanał, z którego kliknięto reset, zostaje — inaczej nie mamy gdzie
+    # wysłać podsumowania (Discord: 400/10003 Unknown Channel).
+    keep_channel_id = interaction.channel_id
+    await safe_defer(interaction, ephemeral=True, where="sys_reset_modal")
     try:
-        results = await reset_server(interaction.guild, interaction.user)
-        embed = discord.Embed(
-            title="💥 Serwer zresetowany",
-            description=(f"Usunięto **{len(results)}** elementów struktury bota.\n```\n"
-                         + "\n".join(results[:20])
-                         + (f"\n... i {len(results) - 20} więcej" if len(results) > 20 else "")
-                         + "\n```\n\nMożesz teraz zbudować nowy design przyciskiem 🎨 w `/system`."),
-            color=C_ORANGE, timestamp=datetime.now(timezone.utc))
-        await interaction.followup.send(embed=embed)
+        results = await reset_server(interaction.guild, interaction.user, keep_channel_id)
+        record = sys_op_record(getattr(interaction, "guild_id", None), "reset", ok=True,
+                               headline=f"Usunięto {len(results)} elementów struktury bota",
+                               detail="\n".join(results), user_id=interaction.user.id)
+        await safe_reply(interaction, embed=sys_op_embed(record), ephemeral=False,
+                         where="sys_reset_modal")
     except Exception as exc:  # noqa: BLE001
         sys_log.error("Blad resetu: %s", exc)
-        await interaction.followup.send(f"❌ Błąd resetu: {exc}", ephemeral=True)
+        record = sys_op_record(getattr(interaction, "guild_id", None), "reset", ok=False,
+                               headline=f"Reset przerwany: {exc}", detail=str(exc),
+                               user_id=interaction.user.id)
+        await safe_reply(interaction, embed=sys_op_embed(record), ephemeral=True,
+                         where="sys_reset_modal")
+
+
+async def run_design_build(interaction: discord.Interaction, where: str = "sys_build_design") -> None:
+    """
+    Buduje estetyczny design i zapisuje raport.
+
+    Ten sam kod obsługuje 🎨 z panelu i ↻ „Ponów operację”, więc po zniknięciu
+    kanału admin odzyskuje wynik jednym klikiem.
+    """
+    if interaction_channel_gone(interaction):
+        sys_log.warning("Kanał akcji %s już nie istnieje — wynik pójdzie fallbackiem.", where)
+    await safe_defer(interaction, ephemeral=True, where=where)
+    try:
+        results = await build_aesthetic_design(interaction.guild, interaction.user)
+        record = sys_op_record(getattr(interaction, "guild_id", None), "build_design", ok=True,
+                               headline=f"Wykonano {len(results)} operacji",
+                               detail="\n".join(results), user_id=interaction.user.id,
+                               extra={"count": len(results)})
+        await safe_reply(interaction, embed=sys_op_embed(record), ephemeral=False, where=where)
+    except Exception as exc:  # noqa: BLE001
+        sys_log.error("Blad budowania designu: %s", exc)
+        record = sys_op_record(getattr(interaction, "guild_id", None), "build_design", ok=False,
+                               headline=f"Operacja przerwana: {exc}", detail=str(exc),
+                               user_id=interaction.user.id)
+        # Raport błędu trafia też na kanał logów, żeby nie zginął razem z kanałem akcji
+        await system_log(interaction.guild, "Zbuduj estetyczny design — BŁĄD",
+                         interaction.user, str(exc)[:500])
+        await safe_reply(interaction, embed=sys_op_embed(record), ephemeral=True, where=where)
+
+
+async def handle_last_op(interaction: discord.Interaction) -> None:
+    """🔁 Raport ostatniej operacji /system (ratunek po 10003 Unknown Channel)."""
+    if not is_authorized(interaction):
+        await safe_reply(interaction, content="⛔ Brak uprawnień.", where="sys_last_op")
+        return
+    record = sys_op_last(getattr(interaction, "guild_id", None))
+    if not record:
+        await safe_reply(interaction, where="sys_last_op", content=(
+            "📭 **Brak zapisanej operacji na tym serwerze.**\n"
+            "Raport pojawi się tutaj po 🎨 designie, ⚠️ resecie albo 👻 Ghost Copy."))
+        return
+    await safe_reply(interaction, embed=sys_op_embed(record), view=sys_op_view(record),
+                     ephemeral=True, where="sys_last_op")
+
+
+async def handle_repeat_last(interaction: discord.Interaction) -> None:
+    """↻ Ponawia ostatnią operację /system (reset zawsze wymaga wpisania POTWIERDZAM)."""
+    if not is_authorized(interaction):
+        await safe_reply(interaction, content="⛔ Brak uprawnień.", where="sys_repeat_last")
+        return
+    record = sys_op_last(getattr(interaction, "guild_id", None))
+    action = (record or {}).get("action")
+    if not action:
+        await safe_reply(interaction, where="sys_repeat_last",
+                         content="📭 Nie ma czego ponawiać — brak zapisanej operacji.")
+        return
+
+    if action == "build_design":
+        await run_design_build(interaction, where="sys_repeat_last")
+        return
+
+    if action == "reset":
+        # Reset jest nieodwracalny — ponowienie też wymaga wpisania POTWIERDZAM.
+        await safe_modal(interaction, reset_confirm_modal(), where="sys_repeat_last")
+        return
+
+    extra = record.get("extra") or {}
+    if action == "apply_template":
+        name = str(extra.get("template") or "")
+        layout = template_load(name) if name else None
+        if not layout:
+            await safe_reply(interaction, where="sys_repeat_last", content=(
+                f"❌ Szablon `{name or '?'}` już nie istnieje — zapisz go ponownie "
+                "przyciskiem 💾, a potem zastosuj z listy."))
+            return
+        await safe_modal(interaction,
+                         ghost_apply_modal(name, len(layout.get("roles") or []),
+                                           len(layout.get("channels") or [])),
+                         where="sys_repeat_last")
+        return
+
+    if action == "clone_guild":
+        await safe_modal(interaction, ghost_clone_modal(), where="sys_repeat_last")
+        return
+
+    await safe_reply(interaction, where="sys_repeat_last",
+                     content="❌ Tej operacji nie da się ponowić automatycznie.")
 
 
 async def announce_build_change(previous_id: str, new_id: str) -> None:
@@ -5618,24 +6011,63 @@ async def cmd_profile(interaction: discord.Interaction,
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="top", description="Ranking twórców — kto zbudował najwięcej paczek")
-async def cmd_top(interaction: discord.Interaction) -> None:
-    """Top 10 twórców według XP."""
-    profiles_load()
-    ranking = sorted(PROFILES.values(), key=lambda p: p.xp, reverse=True)[:10]
-    if not ranking:
-        await interaction.response.send_message("📭 Ranking jest pusty — bądź pierwszy!",
-                                                ephemeral=True)
+@bot.tree.command(name="xp", description="Nadaj lub odejmij XP graczowi — @mention, nie lista")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(gracz="@mention lub ID gracza (nawet jeśli nie jest na serwerze)",
+                       ilosc="Ile XP dodać (+) lub odjąć (−)", powod="Krótka nota")
+async def cmd_xp(interaction: discord.Interaction, gracz: str,
+                  ilosc: app_commands.Range[int, -5000, 5000],
+                  powod: str = "korekta zarządu") -> None:
+    user_id = _id_from_handle(gracz)
+    try:
+        target = await interaction.client.fetch_user(user_id)
+    except Exception:
+        target = None
+
+    if isinstance(interaction.guild, discord.Guild):
+        server_target = interaction.guild.get_member(user_id) or target
+    else:
+        server_target = target
+
+    target = target if server_target is None else server_target
+
+    if target is None:
+        await interaction.response.send_message(
+            f"❌ Nie znalazłem gracza `{gracz}` — sprawdź ID lub użyj @mention.", ephemeral=True)
         return
-    lines = []
-    for index, profile in enumerate(ranking, start=1):
-        medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(index, f"**{index}.**")
-        lines.append(f"{medal} <@{profile.user_id}> — **{profile.rank['name']}** "
-                     f"(poziom {profile.level}, {profile.xp} XP, {profile.builds} paczek)")
-    embed = discord.Embed(title="🏆 Ranking twórców Foundry",
-                          description="\n".join(lines), color=C_YELLOW)
-    embed.set_footer(text="XP zdobywasz za budowanie paczek, wybory w kreatorze, wyszukiwanie i zgłoszenia")
-    await interaction.response.send_message(embed=embed)
+
+    profile = profile_get(target)
+    if profile is None:
+        await interaction.response.send_message("❌ Nie udało się wczytać profilu.", ephemeral=True)
+        return
+
+    message = profile.add_xp("manual", amount=int(ilosc))
+    profile.reports += 1 if ilosc < 0 else 0
+    profiles_save()
+
+    mention = getattr(target, "mention", str(target))
+    if hasattr(target, "name"):
+        mention += f" ({target.name})"
+    await system_log(interaction.guild, "Korekta XP", interaction.user,
+                     f"{mention}: {ilosc:+} XP — {powod}")
+
+    text = (f"✅ {mention}: **{ilosc:+} XP** — {powod}\n"
+            f"Teraz: **{profile.xp} XP** (ranga {profile.rank['name']}, poziom {profile.level})")
+    if message:
+        text += f"\n{message}"
+    await interaction.response.send_message(text)
+
+
+def _id_from_handle(handle: str) -> int:
+    h = handle.strip()
+    if h.startswith("<@!") and h.endswith(">"):
+        return int(h[3:-1])
+    if h.startswith("<@"):
+        return int(h[2:-1])
+    m = re.fullmatch(r"0*([1-9][0-9]{0,18})", h)
+    if m:
+        return int(m.group(1))
+    raise ValueError("To nie wygląda na ID gracza (powinno być @mention lub cyferki).")
 
 
 @bot.tree.command(name="ustawienia", description="Ustawienia profilu: rekomendacje modów na priv")
@@ -5663,22 +6095,47 @@ async def cmd_settings(interaction: discord.Interaction) -> None:
                              else discord.ButtonStyle.success)]))
 
 
-@bot.tree.command(name="xp", description="Nadaj lub odejmij XP twórcy (admin)")
+@bot.tree.command(name="exp", description="Nadaj lub odejmij XP graczowi (ID/mention) — bez listy wybierania")
 @app_commands.default_permissions(administrator=True)
-@app_commands.describe(uzytkownik="Gracz", ilosc="Ile XP dodać (może być ujemne)", powod="Powód")
-async def cmd_xp(interaction: discord.Interaction, uzytkownik: discord.Member,
-                 ilosc: app_commands.Range[int, -5000, 5000], powod: str = "korekta administracji") -> None:
-    """Ręczna korekta XP (np. za pomoc w społeczności)."""
-    profile = profile_get(uzytkownik)
+@app_commands.describe(gracz="ID lub @mention gracza — nie musi być na tym serwerze",
+                       ilosc="Ile XP dodać (+) lub odjąć (−)", powod="Krótka nota")
+async def cmd_exp_new_style(interaction: discord.Interaction, gracz: str,
+                          ilosc: app_commands.Range[int, -5000, 5000],
+                          powod: str = "korekta zarządu") -> None:
+    user_id = _id_from_handle(gracz)
+    try:
+        target = await interaction.client.fetch_user(user_id)
+    except Exception:
+        target = None
+
+    if isinstance(interaction.guild, discord.Guild):
+        server_target = interaction.guild.get_member(user_id) or target
+    else:
+        server_target = target
+
+    target = target if server_target is None else server_target
+
+    if target is None:
+        await interaction.response.send_message(
+            f"❌ Nie znalazłem gracza `{gracz}` — sprawdź ID albo użyj @mention.", ephemeral=True)
+        return
+
+    profile = profile_get(target)
     if profile is None:
         await interaction.response.send_message("❌ Nie udało się wczytać profilu.", ephemeral=True)
         return
+
     message = profile.add_xp("manual", amount=int(ilosc))
     profile.reports += 1 if ilosc < 0 else 0
     profiles_save()
+
+    mention = getattr(target, "mention", str(target))
+    if hasattr(target, "name"):
+        mention += f" ({target.name})"
     await system_log(interaction.guild, "Korekta XP", interaction.user,
-                     f"{uzytkownik} ({uzytkownik.id}): {ilosc:+} XP — {powod}")
-    text = (f"✅ {uzytkownik.mention}: **{ilosc:+} XP** — {powod}\n"
+                     f"{mention}: {ilosc:+} XP — {powod}")
+
+    text = (f"✅ {mention}: **{ilosc:+} XP** — {powod}\n"
             f"Teraz: **{profile.xp} XP** (ranga {profile.rank['name']}, poziom {profile.level})")
     if message:
         text += f"\n{message}"
