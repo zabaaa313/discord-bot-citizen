@@ -501,6 +501,9 @@ header.top{position:sticky;top:0;z-index:60;display:flex;align-items:center;gap:
 .tile{position:relative;display:flex;flex-direction:column;text-align:left;padding:0;
  background:linear-gradient(165deg,#141a2a,#0d111d);border:1px solid var(--line);
  border-radius:var(--r);overflow:hidden;cursor:pointer;color:var(--txt);font:inherit;
+ /* content-visibility: przeglądarka nie liczy layoutu i malowania kafli
+    poza ekranem — zakładka ze 106 kaflami przewija się płynnie. */
+ content-visibility:auto;contain-intrinsic-size:auto 300px;
  transition:transform .16s ease,border-color .16s ease,box-shadow .16s ease;
  animation:pop .34s cubic-bezier(.2,.9,.3,1) both}
 @keyframes pop{from{opacity:0;transform:translateY(10px) scale(.985)}to{opacity:1;transform:none}}
@@ -790,7 +793,8 @@ STUDIO_JS = r"""
     return '<button type="button" class="tile' + (on ? ' on' : '') + (i.locked ? ' locked' : '')
       + '" data-id="' + esc(i.id) + '" style="animation-delay:' + Math.min(idx*16, 320) + 'ms"'
       + ' title="' + esc(i.name) + ' — ' + (on ? 'kliknij, aby usunąć' : 'kliknij, aby dodać') + '">'
-      + '<span class="shot"><img loading="lazy" src="' + esc(i.img) + '" alt="">'
+      + '<span class="shot"><img loading="lazy" decoding="async" width="480" height="270"'
+      + ' src="' + esc(i.img) + '" alt="">'
       + '<span class="shade"></span>' + lock
       + '<span class="tick">' + (on ? '✓' : (i.locked ? '🔒' : '+')) + '</span></span>'
       + '<span class="tbody"><b>' + esc(i.name) + '</b>'
@@ -839,8 +843,7 @@ STUDIO_JS = r"""
     api('/bundle', {id:id}).then(function(d){
       busy = false;
       if (!d || !d.ok){ toast('⚠️ ' + ((d && d.error) || 'Nie udało się nałożyć presetu'), 'err'); return; }
-      S.chosen = new Set(d.chosen || []);
-      render();
+      applyChosen(new Set(d.chosen || []));
       toast('⚡ Preset „' + b.name + '” nałożony (' + (d.added || []).length + ' opcji)', '');
       (d.replaced || []).slice(0, 4).forEach(function(nm){
         toast('🔄 „' + nm + '” zastąpione — ten sam plik docelowy', 'warn');
@@ -915,6 +918,42 @@ STUDIO_JS = r"""
 
   function render(){ renderRail(); renderGrid(); renderPanel(); }
 
+  /* ---------- szybkie odświeżenie: tylko zmienione kafle ----------
+     Kliknięcie NIE odbudowuje już całej siatki (przy 106 kaflach to było
+     odtwarzanie 106 obrazków i przeliczanie layoutu). Zmieniamy tylko te kafle,
+     których dotyczy zmiana — klik jest natychmiastowy. */
+  function changedIds(before, after){
+    var out = [];
+    before.forEach(function(id){ if (!after.has(id)) out.push(id); });
+    after.forEach(function(id){ if (!before.has(id)) out.push(id); });
+    return out;
+  }
+
+  function paintTiles(ids){
+    if (!ids.length) return;
+    var want = {};
+    ids.forEach(function(id){ want[id] = true; });
+    var nodes = document.querySelectorAll('#grid .tile');
+    for (var i = 0; i < nodes.length; i++){
+      var el = nodes[i];
+      if (!want[el.getAttribute('data-id')]) continue;
+      var on = S.chosen.has(el.getAttribute('data-id'));
+      el.classList.toggle('on', on);
+      var tick = el.querySelector('.tick');
+      if (tick) tick.textContent = on ? '✓' : (el.classList.contains('locked') ? '🔒' : '+');
+    }
+  }
+
+  function applyChosen(next){
+    var before = S.chosen;
+    S.chosen = next;
+    if (S.only){          // filtr „tylko wybrane”: trzeba przeliczyć listę kafli
+      renderGrid(); renderRail(); renderPanel(); return;
+    }
+    paintTiles(changedIds(before, next));
+    renderRail(); renderPanel();
+  }
+
   /* ---------- toasty ---------- */
   function toast(msg, kind){
     var box = $('#toasts');
@@ -939,9 +978,12 @@ STUDIO_JS = r"""
     }).then(function(r){ return r.json(); });
   }
 
-  var busy = false;
+  var busy = false;   // tylko dla ciężkich akcji (preset), nie dla zwykłych klików
+  var clickSeq = 0;   // kolejność klików: wolno klikać szybko, stare odpowiedzi ignorujemy
+  /* Klik: zaznaczenie widać NATYCHMIAST (bez czekania na serwer), a bot zapisuje
+     wybór w tle. Gdy bot zmieni coś jeszcze (np. zastąpi opcję tego samego pliku),
+     dosyła pełny stan i podświetlamy tylko zmienione kafle — bez odbudowy siatki. */
   function toggle(id){
-    if (busy) return;
     var it = BY_ID[id];
     if (!it) return;
     if (it.locked){
@@ -950,15 +992,17 @@ STUDIO_JS = r"""
       return;
     }
     var wasOn = S.chosen.has(id);
-    if (wasOn) S.chosen.delete(id); else S.chosen.add(id);
-    render();
-    busy = true;
+    var next = new Set(S.chosen);
+    if (wasOn) next.delete(id); else next.add(id);
+    applyChosen(next);
+    var mine = ++clickSeq;
     api('/toggle', {id:id}).then(function(d){
-      busy = false;
+      if (mine !== clickSeq) return;          // odpowiedź starszego kliku — nie cofamy nowszych
       if (!d || !d.ok){ toast('⚠️ ' + ((d && d.error) || 'Nie udało się zapisać'), 'err');
-        if (wasOn) S.chosen.add(id); else S.chosen.delete(id); render(); return; }
-      S.chosen = new Set(d.chosen || []);
-      render();
+        var back = new Set(S.chosen);
+        if (wasOn) back.add(id); else back.delete(id);
+        applyChosen(back); return; }
+      applyChosen(new Set(d.chosen || []));
       toast((d.added ? '✅ Dodano: ' : '➖ Usunięto: ') + d.name, d.added ? '' : '');
       (d.replaced || []).forEach(function(nm){
         toast('🔄 „' + nm + '” zastąpione — ten sam plik docelowy', 'warn');
@@ -967,9 +1011,11 @@ STUDIO_JS = r"""
         toast('⚡ Bot scala plik: ' + shortFile(f));
       });
     }).catch(function(){
-      busy = false;
+      if (mine !== clickSeq) return;
       toast('⚠️ Brak połączenia z botem — spróbuj ponownie', 'err');
-      if (wasOn) S.chosen.add(id); else S.chosen.delete(id); render();
+      var back = new Set(S.chosen);
+      if (wasOn) back.add(id); else back.delete(id);
+      applyChosen(back);
     });
   }
 
@@ -999,7 +1045,12 @@ STUDIO_JS = r"""
 
   document.addEventListener('DOMContentLoaded', function(){
     var q = $('#q');
-    if (q) q.addEventListener('input', function(){ S.q = q.value; renderGrid(); });
+    var qTimer = null;
+    if (q) q.addEventListener('input', function(){
+      S.q = q.value;
+      if (qTimer) clearTimeout(qTimer);            // filtr nie liczy się przy każdym znaku
+      qTimer = setTimeout(renderGrid, 120);
+    });
     var only = $('#only');
     if (only) only.addEventListener('click', function(){
       S.only = !S.only;
@@ -1020,8 +1071,7 @@ STUDIO_JS = r"""
     if (clr) clr.addEventListener('click', function(){
       if (!confirm('Usunąć wszystkie wybory?')) return;
       api('/clear', {}).then(function(){
-        S.chosen = new Set();
-        render();
+        applyChosen(new Set());
         toast('🗑 Wyczyszczono wybory');
       });
     });
