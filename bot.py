@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import math
 import hmac
 import html
 import io
@@ -59,7 +60,13 @@ from citizen_gen import (
     generate_citizen_file,
     sky_preset_params,
 )
-# Kreator WWW (ładna strona: 1 opcja na ekran + duży podgląd)
+# Palety nowych opcji (krew, efekt strzału, opony) — jedno źródło prawdy dla
+# generatora plików ORAZ podglądów w kreatorze (kafelek = realny kolor w grze).
+import citizen_mods
+from citizen_mods import (
+    BLOOD_COLOURS, BLOOD_SIZES, TRACE_COLOURS, TRACE_SIZES, WHEEL_COLOURS,
+)
+# Kreator WWW — studio z zakładkami, siatką kafli i auto-doborem plików
 import web_creator
 from web_creator import (
     WEB_SESSIONS,
@@ -68,6 +75,14 @@ from web_creator import (
     render_citizen_page,
     render_skins_page,
     render_home_page,
+    render_pack_done,
+    creator_item,
+    apply_bundle,
+    build_state,
+    toggle_item,
+    clear_items,
+    chosen_ids,
+    output_groups,
 )
 
 # .env szukamy najpierw obok pliku bot.py (działa też, gdy plik leży na Pulpicie),
@@ -538,13 +553,18 @@ def hashes_to_text(hashes: Sequence[Dict[str, Any]], build_name: str = "", user_
 conf_log = log("Conflicts")
 
 # Pary (gen_file, slot) — kroki dzielące ten sam plik, ale NIE kolidujące:
-# każdy slot to osobny "pokrętło" tego samego pliku (np. blood = baza,
-# kill = efekt zabicia, head = efekt headshota — łączą się w jeden bloodfx.dat).
-_COMPOSABLE_SLOTS = {"kill_style", "head_style"}
+# każdy slot to osobne "pokrętło" pliku, a wszystkie scalają się w JEDEN plik
+# (np. krew + rozmiar krwi + kolor głowy + headshot → jeden bloodfx.dat).
+# Kolejność jest STAŁA (tuple) — klucze plików muszą być deterministyczne.
+_COMPOSABLE_SLOTS: Tuple[str, ...] = (
+    "blood_colour", "blood_size", "head_colour", "head_size",
+    "trace_colour", "trace_size", "wheel_colour",
+    "kill_color", "kill_style", "kill_blur",
+)
 
 
 def _gen_slot(item: Dict[str, str]) -> str:
-    """Który "pokrętło" pliku ustawia ten krok (dla kroków komponowalnych)."""
+    """Osobne „pokrętło” pliku, które ustawia ten krok (kroki komponowalne)."""
     params = item.get("gen_params") or {}
     for slot in _COMPOSABLE_SLOTS:
         if slot in params:
@@ -806,7 +826,23 @@ def _cloud_cover(density: float, seed: int) -> float:
 
 def sky_png(params: Dict[str, float], seed: int = 0, *, rain: float = 0.0,
             grade: Optional[str] = None, storm: bool = False, blood: float = 0.0,
-            blood_head: float = 0.0, sun: str = "mid", moon_big: bool = False) -> bytes:
+            blood_head: float = 0.0, sun: str = "mid", moon_big: bool = False,
+            blood_rgb: Optional[Tuple[int, int, int]] = None,
+            trace_rgb: Optional[Tuple[int, int, int]] = None,
+            trace_scale: float = 1.0,
+            wheel_rgb: Optional[Tuple[int, int, int]] = None,
+            water_rgb: Optional[Tuple[int, int, int]] = None,
+            fog_amount: float = 0.0,
+            smoke: float = 0.0,
+            fire: float = 0.0,
+            scorch: bool = True,
+            blur_amount: float = 0.0,
+            moon_rgb: Optional[Tuple[int, int, int]] = None,
+            sun_rgb: Optional[Tuple[int, int, int]] = None,
+            sun_scale: float = 1.0,
+            cloud_tint: Optional[Tuple[int, int, int]] = None,
+            ground_glow: Optional[Tuple[int, int, int]] = None,
+            ground_glow_strength: float = 0.35) -> bytes:
     """
     REALISTYCZNY podgląd nieba z parametrów sggd.xml (to co gracz zobaczy w grze):
       • gradient zenith -> horizon z realnych kolorów (sky_zenith_col, sky_horizon_col)
@@ -877,6 +913,8 @@ def sky_png(params: Dict[str, float], seed: int = 0, *, rain: float = 0.0,
             cx, cy = rng.randint(-40, PREVIEW_W + 40), rng.randint(8, horizon_y - 30)
             base_r = rng.randint(14, 40)
             shade = _mix((250, 250, 252), _mix(east, (60, 70, 95), 0.5), rng.random() * 0.7)
+            if cloud_tint is not None:                   # kolor custom chmur
+                shade = _mix(shade, cloud_tint, 0.55)
             for part in range(rng.randint(4, 9)):
                 px = cx + rng.randint(-int(base_r * 1.6), int(base_r * 1.6))
                 py = cy + rng.randint(-base_r // 2, base_r // 2)
@@ -886,18 +924,23 @@ def sky_png(params: Dict[str, float], seed: int = 0, *, rain: float = 0.0,
                     _disc_soft(buf, px, py, ring, shade, strength, limit_y=horizon_y)
 
     # --- słońce (tarcza + halo) ---
-    sun_r = int(15 * sun_glow)
-    _disc_soft(buf, sun_x, sun_y, int(sun_r * 2.4), _mix(east, (255, 250, 220), 0.6), 0.35,
+    sun_r = max(4, int(15 * sun_glow * max(0.3, min(3.0, sun_scale))))
+    sun_col = _mix(sun_rgb or east, (255, 252, 235), 0.45)
+    _disc_soft(buf, sun_x, sun_y, int(sun_r * 2.4), _mix(sun_col, (255, 250, 220), 0.5), 0.35,
                limit_y=horizon_y)
-    _disc(buf, sun_x, sun_y, sun_r, _mix(east, (255, 255, 240), 0.85))
+    _disc(buf, sun_x, sun_y, sun_r, _mix(sun_col, (255, 255, 240), 0.85))
 
     # --- księżyc (widoczny wg intensywności; duży gdy moon_disc_size > 1) ---
     if moon_inten > 0.05:
         moon_x, moon_y = int(PREVIEW_W * 0.18), int(horizon_y * 0.28)
-        moon_r = max(7, int(13 * moon_size))
+        moon_r = max(7, int(13 * moon_size * max(0.3, min(3.0, sun_scale))))
         glow_m = _mix((200, 210, 255), (255, 255, 255), moon_inten)
+        if moon_rgb is not None:
+            glow_m = _mix(glow_m, moon_rgb, 0.75)
         _disc_soft(buf, moon_x, moon_y, int(moon_r * 2.0), glow_m, 0.30 * moon_inten, limit_y=horizon_y)
-        _disc(buf, moon_x, moon_y, moon_r, _mix((225, 230, 245), (255, 255, 255), moon_inten))
+        _disc(buf, moon_x, moon_y, moon_r,
+              _mix(_mix((225, 230, 245), (255, 255, 255), moon_inten),
+                   moon_rgb or (225, 230, 245), 0.65))
         # cień/krater dla realizmu
         _disc(buf, moon_x + moon_r // 3, moon_y - moon_r // 4, max(2, moon_r // 4),
               _mix(glow_m, (140, 150, 180), 0.35))
@@ -907,8 +950,69 @@ def sky_png(params: Dict[str, float], seed: int = 0, *, rain: float = 0.0,
     # prosty krajobraz: wzgórza
     hill_h = int((PREVIEW_H - horizon_y) * 0.35)
     for x in range(PREVIEW_W):
-        h = hill_h // 2 + int((hill_h / 2) * (1 + __import__("math").sin(x * 0.02 + seed % 7)))
+        h = hill_h // 2 + int((hill_h / 2) * (1 + math.sin(x * 0.02 + seed % 7)))
         _rect(buf, x, horizon_y + hill_h - h, x + 1, PREVIEW_H, _mix(ground, (8, 9, 12), 0.45))
+
+    # --- POŚWIATA / TONACJA TERENU (światła uliczne, kałuże, cienie) ---
+    if ground_glow is not None:
+        strength = max(0.0, min(1.0, ground_glow_strength))
+        for y in range(horizon_y, PREVIEW_H):
+            t = 1.0 - (y - horizon_y) / max(1, PREVIEW_H - horizon_y)
+            row = buf[y]
+            for x in range(PREVIEW_W):
+                row[x] = _mix(row[x], ground_glow, strength * (0.35 + 0.65 * t))
+
+    # --- WODA (water_* z MATOL.xml): pas wody w realnym kolorze z pliku ---
+    if water_rgb is not None:
+        top = horizon_y + int((PREVIEW_H - horizon_y) * 0.42)
+        for y in range(top, PREVIEW_H):
+            t = (y - top) / max(1, PREVIEW_H - top)
+            water_col = _mix(_mix(water_rgb, (255, 255, 255), 0.22),
+                             _mix(water_rgb, (0, 0, 0), 0.5), t)
+            row = buf[y]
+            for x in range(PREVIEW_W):
+                row[x] = _mix(row[x], water_col, 0.88)
+        for x in range(PREVIEW_W):                       # refleks słońca na wodzie
+            if abs(x - sun_x) < 3:
+                for y in range(top, PREVIEW_H, 6):
+                    buf[y][x] = _mix(buf[y][x], (255, 250, 225), 0.4)
+
+    # --- MGŁA (fog_*): biała zasłona rośnie przy ziemi ---
+    if fog_amount > 0:
+        amount = max(0.0, min(1.0, fog_amount))
+        fog_col = _mix((206, 212, 222), horizon, 0.25)
+        for y in range(horizon_y, PREVIEW_H):
+            t = 1.0 - (y - horizon_y) / max(1, PREVIEW_H - horizon_y)
+            strength = min(1.0, amount * (0.4 + 0.7 * t))
+            row = buf[y]
+            for x in range(PREVIEW_W):
+                row[x] = _mix(row[x], fog_col, strength)
+        for y in range(int(horizon_y * 0.55), horizon_y):
+            row = buf[y]
+            for x in range(PREVIEW_W):
+                row[x] = _mix(row[x], fog_col, amount * 0.45)
+
+    # --- OGIEŃ / EKSPLOZJE (fire_*, expl_*) ---
+    if fire > 0:
+        rng_f = random.Random((seed or 7) + 626)
+        power = max(0.35, min(3.0, fire))
+        for _ in range(int(3 + 5 * power)):
+            cx = rng_f.randint(30, PREVIEW_W - 30)
+            cy = rng_f.randint(horizon_y + 4, PREVIEW_H - 8)
+            radius = rng_f.randint(9, int(14 + 20 * power))
+            if scorch:                                   # ślad przypalenia
+                _disc_soft(buf, cx, cy, int(radius * 1.5), (28, 24, 22), 0.5)
+            _disc_soft(buf, cx, cy, int(radius * 1.9), (255, 140, 35), 0.4)
+            _disc_soft(buf, cx, cy, radius, (255, 196, 80), 0.85)
+            _disc(buf, cx, cy, max(3, radius // 3), (255, 246, 205))
+
+    # --- DYM (smoke-off / cząstki otoczenia) ---
+    if smoke > 0:
+        rng_s = random.Random((seed or 7) + 313)
+        for _ in range(int(16 * max(0.3, min(2.0, smoke)))):
+            cx = rng_s.randint(20, PREVIEW_W - 20)
+            cy = rng_s.randint(int(horizon_y * 0.35), PREVIEW_H - 10)
+            _disc_soft(buf, cx, cy, rng_s.randint(13, 32), (122, 124, 130), 0.34)
 
     # --- KREW (podgląd efektów kombat: baza + kill + head razem) ---
     if blood > 0 or blood_head > 0:
@@ -924,13 +1028,46 @@ def sky_png(params: Dict[str, float], seed: int = 0, *, rain: float = 0.0,
                 cx = rng_b.randint(int(PREVIEW_W * 0.3), int(PREVIEW_W * 0.7))
                 cy = rng_b.randint(int(horizon_y * 0.30), horizon_y - 25)
                 r = rng_b.randint(4, int(8 + 18 * blood_head))
-            col = _mix((168, 18, 28), (225, 45, 45), rng_b.random() * 0.5)
+            tint = blood_rgb or (200, 20, 20)
+            col = _mix(_mix(tint, (20, 0, 0), 0.35), _mix(tint, (255, 255, 255), 0.45),
+                       rng_b.random() * 0.5)
             _disc_soft(buf, cx, cy, r, col, 0.8)
-        if blood > 0:                # czerwona poświata sceny
+        if blood > 0:                # poświata sceny w kolorze wybranej krwi
+            tint = blood_rgb or (200, 20, 20)
             for y in range(horizon_y, PREVIEW_H):
                 row = buf[y]
                 for x in range(PREVIEW_W):
-                    row[x] = _mix(row[x], (120, 12, 20), 0.12 * min(1.0, blood))
+                    row[x] = _mix(row[x], _mix(tint, (0, 0, 0), 0.55),
+                                  0.16 * min(1.2, blood))
+
+    # --- EFEKT STRZAŁU (weaponfx.dat): dziury po kulach + smugi w kolorze COL_TINT
+    if trace_rgb is not None:
+        rng_t = random.Random((seed or 7) + 4242)
+        holes = int(9 * max(0.4, min(3.0, trace_scale)))
+        for _ in range(holes):
+            cx = rng_t.randint(20, PREVIEW_W - 20)
+            cy = rng_t.randint(horizon_y + 6, PREVIEW_H - 6)
+            radius = max(2, int(rng_t.randint(4, 9) * min(3.0, trace_scale)))
+            _disc_soft(buf, cx, cy, radius, trace_rgb, 0.8)
+        for _ in range(int(5 * max(0.4, min(3.0, trace_scale)))):
+            x0 = rng_t.randint(0, PREVIEW_W - 34)
+            y0 = rng_t.randint(8, max(9, int(horizon_y * 0.65)))
+            length = rng_t.randint(16, 34)
+            for i in range(length):
+                xx, yy = x0 + i, y0 + i // 2
+                if i % 2 == 0 and 0 <= yy < horizon_y and 0 <= xx < PREVIEW_W:
+                    buf[yy][xx] = _mix(buf[yy][xx], trace_rgb, 0.65)
+
+    # --- ŚLADY OPON (wheelfx.dat): dwa pasy skidmarków w kolorze COL_TINT ---
+    if wheel_rgb is not None:
+        for lane, base_y in ((0, 0.30), (1, 0.62)):
+            y0 = horizon_y + int((PREVIEW_H - horizon_y) * base_y)
+            for x in range(24, PREVIEW_W - 24):
+                yy = y0 + int(7 * math.sin(x * 0.025 + lane * 1.7))
+                if horizon_y <= yy < PREVIEW_H:
+                    buf[yy][x] = _mix(buf[yy][x], wheel_rgb, 0.85)
+                    if yy + 1 < PREVIEW_H:
+                        buf[yy + 1][x] = _mix(buf[yy + 1][x], wheel_rgb, 0.45)
 
     # --- BURZA: przyciemnienie + DESZCZ (krople widoczne jak w grze) ---
     if storm:
@@ -967,7 +1104,54 @@ def sky_png(params: Dict[str, float], seed: int = 0, *, rain: float = 0.0,
                     for x in range(gx, x1):
                         row[x] = out
 
+    # --- BLUR / DOF / LENS (blur_*) — rozmycie + delikatna winieta ---
+    if blur_amount > 0:
+        buf = _blur(buf, 2 if blur_amount < 1.5 else 4)
+        cx, cy = PREVIEW_W / 2, PREVIEW_H / 2
+        dmax = (cx * cx + cy * cy) ** 0.5
+        for y in range(0, PREVIEW_H, 3):
+            row = buf[y]
+            for x in range(0, PREVIEW_W, 3):
+                d = (((x - cx) ** 2 + (y - cy) ** 2) ** 0.5) / dmax
+                col = _mix(row[x], (0, 0, 0), 0.22 * d * d * min(1.5, blur_amount))
+                for yy in range(y, min(y + 3, PREVIEW_H)):
+                    for xx in range(x, min(x + 3, PREVIEW_W)):
+                        buf[yy][xx] = col
+
     return png_encode(buf)
+
+
+def _blur(buf: List[List[Tuple[int, int, int]]], radius: int) -> List[List[Tuple[int, int, int]]]:
+    """Szybki box-blur (osobno X i Y) — podglądy blur/DOF jak w grze."""
+    if radius < 1:
+        return buf
+    height, width = len(buf), len(buf[0])
+    tmp: List[List[Tuple[int, int, int]]] = [[(0, 0, 0)] * width for _ in range(height)]
+    for y in range(height):
+        row = buf[y]
+        for x in range(width):
+            r = g = b = n = 0
+            for dx in range(-radius, radius + 1):
+                xx = min(width - 1, max(0, x + dx))
+                pr, pg, pb = row[xx]
+                r += pr
+                g += pg
+                b += pb
+                n += 1
+            tmp[y][x] = (r // n, g // n, b // n)
+    out: List[List[Tuple[int, int, int]]] = [[(0, 0, 0)] * width for _ in range(height)]
+    for y in range(height):
+        for x in range(width):
+            r = g = b = n = 0
+            for dy in range(-radius, radius + 1):
+                yy = min(height - 1, max(0, y + dy))
+                pr, pg, pb = tmp[yy][x]
+                r += pr
+                g += pg
+                b += pb
+                n += 1
+            out[y][x] = (r // n, g // n, b // n)
+    return out
 
 
 def _pixel_grade(grade: str, rgb: Tuple[int, int, int], x: int, y: int,
@@ -1091,6 +1275,206 @@ def skin_image_key(weapon: Dict[str, Any], skin: Dict[str, Any]) -> str:
     return f"skin-{_safe_key(skin.get('id', 'skin'))}"
 
 
+def _catalog_preview(base: Dict[str, float], params: Dict[str, Any],
+                     step: Dict[str, Any], seed: int) -> Optional[bytes]:
+    """
+    Podgląd dla nowych grup katalogu (krew, efekt strzału, opony, czas, woda,
+    mgła, światło, postfx, blur, eksplozje, dym, visual settings…).
+
+    Render liczymy WPROST z parametrów kroku — kafel pokazuje dokładnie ten
+    kolor/efekt, który generator wpisze do pliku w paczce. Zwraca None, gdy krok
+    nie należy do żadnej z tych grup (wtedy działa podgląd awaryjny).
+    """
+    # --- KREW (effects/bloodfx.dat) ---
+    if params.get("blood_colour") or params.get("blood_size"):
+        rgb = BLOOD_COLOURS.get(str(params.get("blood_colour")), (200, 20, 20))
+        scale = float(BLOOD_SIZES.get(str(params.get("blood_size")), 1.0))
+        return sky_png(base, seed=seed, blood=scale, blood_rgb=rgb)
+
+    # --- EFEKT STRZAŁU (effects/weaponfx.dat) ---
+    if params.get("trace_colour") or params.get("trace_size"):
+        rgb = TRACE_COLOURS.get(str(params.get("trace_colour")), (230, 230, 230))
+        scale = float(TRACE_SIZES.get(str(params.get("trace_size")), 1.0))
+        return sky_png(base, seed=seed, trace_rgb=rgb, trace_scale=scale)
+
+    # --- OPONY / DRIFT (effects/wheelfx.dat) ---
+    if params.get("wheel_colour"):
+        rgb = WHEEL_COLOURS.get(str(params.get("wheel_colour")), (12, 12, 12))
+        return sky_png(base, seed=seed, wheel_rgb=rgb)
+
+    # --- BEZ DEKALI (effects/decals.dat) ---
+    if str(params.get("decals_style") or "") == "clear":
+        sky = dict(base)
+        sky["sky_cloud_density_mult"] = 0.22
+        return sky_png(sky, seed=seed)
+
+    # --- CZAS (levels/gta5/time.xml): zawsze dzień / zawsze noc / złota godzina ---
+    if params.get("time_mode"):
+        sky, sun, moon_big = _sky_for_time(base, str(params["time_mode"]))
+        return sky_png(sky, seed=seed, sun=sun, moon_big=moon_big)
+
+    # --- POGODA (levels/gta5/weather.xml) ---
+    if params.get("weather_style"):
+        rain, storm, density = _WEATHER_PREVIEW.get(str(params["weather_style"]),
+                                                   (0.0, False, 0.4))
+        sky = dict(base)
+        sky["sky_cloud_density_mult"] = density
+        return sky_png(sky, seed=seed, rain=rain, storm=storm)
+
+    # --- SŁOŃCE / KSIĘŻYC (MATOL.xml) ---
+    if params.get("sun_style"):
+        style = str(params["sun_style"])
+        sky = dict(base)
+        sun = "high" if style == "soft" else "mid"
+        if style == "golden":
+            sun = "low"
+        if style == "rays-off":
+            sky["sky_sunburst_imten"] = 0.35
+        return sky_png(sky, seed=seed, sun=sun, sun_rgb=_SUN_RGB.get(style),
+                       sun_scale=1.25 if style == "warm" else 1.0)
+    if params.get("moon_style"):
+        style = str(params["moon_style"])
+        sky = dict(base)
+        sky["sky_moon_iten"] = 0.95
+        if style == "small":
+            sky["sky_moon_disc_size"] = 0.6
+        return sky_png(sky, seed=seed, moon_big=(style == "huge"),
+                       moon_rgb=_MOON_RGB.get(style))
+
+    # --- CHMURY (MATOL / clouds.xml / cloudkeyframes.xml) ---
+    if params.get("cloud_matol"):
+        sky = dict(base)
+        sky["sky_cloud_density_mult"] = _CLOUD_DENSITY.get(str(params["cloud_matol"]), 0.35)
+        return sky_png(sky, seed=seed)
+    if params.get("cloud_color"):
+        return sky_png(base, seed=seed,
+                       cloud_tint=_CLOUD_TINT.get(str(params["cloud_color"])))
+    if params.get("clouds_geom"):
+        density = {"high": 0.3, "low": 0.55, "big": 0.75, "small": 0.4,
+                   "fast": 0.45}.get(str(params["clouds_geom"]), 0.4)
+        sky = dict(base)
+        sky["sky_cloud_density_mult"] = density
+        return sky_png(sky, seed=seed)
+    if params.get("clouds_key"):
+        density = {"dense": 0.95, "sparse": 0.25, "fast": 0.5,
+                   "slow": 0.6}.get(str(params["clouds_key"]), 0.4)
+        sky = dict(base)
+        sky["sky_cloud_density_mult"] = density
+        return sky_png(sky, seed=seed)
+
+    # --- WODA (MATOL.xml) ---
+    if params.get("water_style"):
+        return sky_png(base, seed=seed,
+                       water_rgb=_WATER_RGB.get(str(params["water_style"])))
+
+    # --- MGŁA (MATOL.xml) ---
+    if params.get("fog_style"):
+        amount = _FOG_AMOUNT.get(str(params["fog_style"]), 0.0)
+        return sky_png(base, seed=seed, fog_amount=amount)
+
+    # --- ŚWIATŁO (MATOL.xml): nocne miasto, latarnie, ped-light ---
+    if params.get("light_style"):
+        style = str(params["light_style"])
+        glow = _LIGHT_RGB.get(style)
+        sky, _sun, _big = _sky_for_time(base, "always-night")
+        strength = 0.12 if style == "street-off" else 0.45
+        return sky_png(sky, seed=seed, ground_glow=glow, ground_glow_strength=strength)
+
+    # --- KOLORY / POSTFX (timecycle_mods_4.xml) ---
+    if params.get("postfx_style"):
+        grade = _POSTFX_GRADE.get(str(params["postfx_style"]))
+        return sky_png(base, seed=seed, grade=grade)
+
+    # --- BLUR / DOF / LENS ---
+    if params.get("blur_style"):
+        amount = _BLUR_AMOUNT.get(str(params["blur_style"]), 0.5)
+        return sky_png(base, seed=seed, blur_amount=amount)
+
+    # --- KILL EFFECT (kolor + siła + blur) ---
+    if params.get("kill_color") or params.get("kill_style") or params.get("kill_blur"):
+        rgb = _KILL_RGB.get(str(params.get("kill_color")), _KILL_RGB.get("red"))
+        level = _KILL_LEVEL.get(str(params.get("kill_style")), 0.9)
+        blur = _KILL_BLUR.get(str(params.get("kill_blur")), 0.0)
+        return sky_png(base, seed=seed, blood=level, blood_rgb=rgb, blur_amount=blur)
+
+    # --- EKSPLOZJE / OGIERŃ ---
+    if params.get("expl_scale") or params.get("expl_count") or params.get("expl_scorch"):
+        power = _EXPL_POWER.get(str(params.get("expl_scale")), 1.0)
+        if str(params.get("expl_count") or "") == "more":
+            power *= 1.4
+        elif str(params.get("expl_count") or "") == "less":
+            power *= 0.6
+        scorch = str(params.get("expl_scorch") or "") != "off"
+        return sky_png(base, seed=seed, fire=power, scorch=scorch)
+    if params.get("fire_style"):
+        power = _FIRE_POWER.get(str(params["fire_style"]), 0.8)
+        return sky_png(base, seed=seed, fire=power)
+
+    # --- DYM I CZĄSTKI ---
+    if params.get("smoke_style") or params.get("particle_style"):
+        smoke = 1.0 if params.get("smoke_style") else 0.0
+        if params.get("particle_style"):
+            smoke = 1.6 if str(params["particle_style"]) == "all-off" else 1.2
+        return sky_png(base, seed=seed, smoke=smoke, cloud_tint=(120, 122, 130))
+
+    # --- VISUAL SETTINGS: deszcz, cykl, słońce, chmury, cienie, kałuże ---
+    if params.get("rain_vis"):
+        rain = _VISUAL_RAIN.get(str(params["rain_vis"]), 0.4)
+        sky = dict(base)
+        sky["sky_cloud_density_mult"] = max(0.45, rain)
+        return sky_png(sky, seed=seed, rain=rain,
+                       ground_glow=(150, 170, 210) if rain > 0 else None,
+                       ground_glow_strength=0.18)
+    if params.get("cycle_vis"):
+        sky, sun, big = _sky_for_time(base, "dynamic")
+        return sky_png(sky, seed=seed, sun=sun, moon_big=big)
+    if params.get("sun_vis"):
+        style = str(params["sun_vis"])
+        scale = {"big": 1.8, "small": 0.55, "glow": 1.4}.get(style, 1.0)
+        sky = dict(base)
+        sky["sky_sunburst_imten"] = 1.6 if style == "glow" else sky.get("sky_sunburst_imten", 1.0)
+        return sky_png(sky, seed=seed, sun_scale=scale, sun_rgb=(255, 240, 200))
+    if params.get("cloud_vis"):
+        density = {"motion-off": 0.6, "fast": 0.5, "slow": 0.7}.get(str(params["cloud_vis"]), 0.5)
+        sky = dict(base)
+        sky["sky_cloud_density_mult"] = density
+        return sky_png(sky, seed=seed)
+    if params.get("shadow_vis"):
+        on = str(params["shadow_vis"]) == "on"
+        return sky_png(base, seed=seed, sun_scale=1.2 if on else 0.9,
+                       ground_glow=(0, 0, 0) if on else (70, 70, 80),
+                       ground_glow_strength=0.35)
+    if params.get("puddle_vis"):
+        on = str(params["puddle_vis"]) == "on"
+        return sky_png(base, seed=seed, rain=0.25 if on else 0.0,
+                       ground_glow=(120, 150, 200) if on else None,
+                       ground_glow_strength=0.3)
+    if params.get("car_vis"):
+        on = str(params["car_vis"]) == "interior-on"
+        sky, _s, _b = _sky_for_time(base, "always-night")
+        return sky_png(sky, seed=seed,
+                       ground_glow=(255, 200, 140) if on else (40, 45, 60),
+                       ground_glow_strength=0.3)
+    if params.get("dof_vis"):
+        return sky_png(base, seed=seed, blur_amount=0.5)
+
+    # --- WYDAJNOŚĆ (FPS) — czysty, „odchudzony” obraz ---
+    if params.get("fps_style"):
+        sky = dict(base)
+        sky["sky_cloud_density_mult"] = 0.12
+        sky["sky_sunburst_imten"] = 0.4
+        return sky_png(sky, seed=seed)
+
+    # --- HUD / UI — schematyczne ujęcie menu ---
+    if params.get("hud_style"):
+        return scene_png("1b2130", "39405a", "7aa2ff", horizon=0.72)
+
+    # --- VISUAL SETTINGS: pozostałe (drobne przełączniki) ---
+    if any(key.endswith("_vis") for key in params):
+        return scene_png("22304a", "4a5a44", "ffd166", horizon=0.66)
+    return None
+
+
 def _step_seed(step: Dict[str, Any]) -> int:
     """Deterministyczne ziarno podglądu (ten sam krok = ten sam obrazek)."""
     return zlib.crc32(str(step.get("id", "")).encode())
@@ -1130,6 +1514,69 @@ def step_image(step: Dict[str, Any]) -> bytes:
     return png
 
 
+# ---------------------------------------------------------------------------
+# PALETY PODGLĄDÓW — kafelek pokazuje DOKŁADNIE ten kolor/efekt, który trafi
+# do pliku w paczce (te same wartości, których używa generator z citizen_mods).
+# ---------------------------------------------------------------------------
+
+_WATER_RGB = {"clean": (46, 118, 158), "dark": (10, 22, 32), "mirror": (96, 150, 186),
+              "calm": (34, 92, 132), "storm": (24, 64, 96), "no-foam": (40, 104, 144)}
+_FOG_AMOUNT = {"off": 0.0, "light": 0.35, "dense": 0.7, "horror": 0.95, "no-volume": 0.15}
+_CLOUD_TINT = {"white": (250, 250, 252), "pink": (255, 190, 215), "purple": (200, 160, 255),
+               "red": (255, 150, 130), "cyan": (150, 235, 245), "green": (170, 245, 170)}
+_CLOUD_DENSITY = {"off": 0.0, "dense": 0.9, "soft": 0.45, "cotton": 0.7,
+                  "dark": 0.8, "golden": 0.5}
+_POSTFX_GRADE = {"vivid": "vivid", "film": "film", "cold": "cold", "contrast": "film",
+                 "desat": "film", "neutral": None, "bloom-off": "vivid",
+                 "vignette-off": None}
+_BLUR_AMOUNT = {"motion-off": 0.6, "screen-off": 0.9, "dof-off": 0.5, "lens-off": 0.4,
+                "chroma-off": 0.3, "bokeh-off": 0.9, "all-off": 1.5}
+_LIGHT_RGB = {"street-bright": (255, 220, 150), "street-off": (12, 12, 16),
+              "night-bright": (200, 212, 240), "ped-visible": (255, 200, 180),
+              "warm": (255, 190, 120), "cold": (170, 205, 255),
+              "interiors": (255, 226, 172)}
+_WEATHER_PREVIEW = {"always-sunny": (0.0, False, 0.15), "always-rain": (0.9, False, 0.85),
+                    "stormy": (0.8, True, 0.95), "always-fog": (0.0, False, 0.6),
+                    "smog": (0.0, False, 0.7), "snow": (0.6, False, 0.8),
+                    "xmas": (0.5, False, 0.7), "balanced": (0.0, False, 0.4)}
+_TIME_MODES = {"always-day": (1.0, "high", False), "always-night": (0.22, "mid", True),
+               "golden": (0.95, "low", False), "sunrise": (0.8, "low", False),
+               "dynamic": (1.0, "mid", False)}
+_KILL_RGB = {name: tuple(int(round(c * 255)) for c in data["ped"])
+             for name, data in citizen_mods.KILL_COLORS.items()}
+_KILL_LEVEL = {"subtle": 0.4, "normal": 0.85, "strong": 1.4, "extreme": 2.1, "off": 0.0}
+_KILL_BLUR = {"off": 0.0, "soft": 0.6, "strong": 1.4}
+_FIRE_POWER = {"short": 0.6, "long": 1.1, "eternal": 1.8, "off": 0.0}
+_EXPL_POWER = {"tiny": 0.5, "big": 1.2, "huge": 1.9, "insane": 2.6}
+_MOON_RGB = {"red": (235, 90, 80), "blue": (150, 190, 255), "huge": None, "small": None,
+             "dark": (120, 120, 140)}
+_SUN_RGB = {"warm": (255, 205, 130), "cold": (205, 225, 255), "golden": (255, 180, 80),
+            "soft": (255, 250, 235), "rays-off": (255, 250, 235)}
+_VISUAL_RAIN = {"off": 0.0, "light": 0.35, "heavy": 0.75, "insane": 1.0}
+
+
+def _sky_for_time(base: Dict[str, float], mode: str) -> Tuple[Dict[str, float], str, bool]:
+    """Niebo dla trybu czasu (time.xml): jasność, słońce/księżyc, barwy pory dnia."""
+    mult, sun, moon_big = _TIME_MODES.get(mode, (1.0, "mid", False))
+    sky = dict(base)
+    if mult != 1.0:
+        for name, value in list(sky.items()):
+            if name.endswith(("_col_r", "_col_g", "_col_b")):
+                sky[name] = max(0.0, float(value) * mult)
+    if mode == "golden":
+        sky.update({"sky_horizon_col_r": 0.98, "sky_horizon_col_g": 0.70,
+                    "sky_horizon_col_b": 0.38, "sky_azimuth_east_col_r": 1.0,
+                    "sky_azimuth_east_col_g": 0.60, "sky_azimuth_east_col_b": 0.22})
+    elif mode == "sunrise":
+        sky.update({"sky_horizon_col_r": 0.92, "sky_horizon_col_g": 0.72,
+                    "sky_horizon_col_b": 0.80, "sky_azimuth_east_col_r": 1.0,
+                    "sky_azimuth_east_col_g": 0.72, "sky_azimuth_east_col_b": 0.58})
+    elif mode == "always-night":
+        sky.update({"sky_moon_iten": 0.95, "sky_moon_disc_size": 1.7,
+                    "sky_cloud_density_mult": 0.22})
+    return sky, sun, moon_big
+
+
 def _render_step_image(step: Dict[str, Any]) -> bytes:
     """Właściwy render podglądu kroku (wolna ścieżka, raz na krok)."""
     key = step_image_key(step)
@@ -1139,7 +1586,13 @@ def _render_step_image(step: Dict[str, Any]) -> bytes:
         seed = _step_seed(step)
         base = sky_preset_params("sky-anime")  # neutralna scena bazowa dla efektów
 
-        if step.get("gen_file") == "timecycle/sggd.xml" and params.get("sky_preset"):
+        # 0) NOWE OPCJE (krew, traces, opony, dekale, czas, woda, mgła, światło…)
+        #    — podgląd liczony WPROST z parametrów kroku, więc kafel nie kłamie.
+        preview = _catalog_preview(base, params, step, seed)
+        if preview is not None:
+            return preview
+
+        if step.get("gen_file") == "timecycle/MATOL.xml" and params.get("sky_preset"):
             # niebo: dokładne parametry presetu (+ clouds off/dense)
             sky_params = sky_preset_params(str(params["sky_preset"]), params)
             return sky_png(sky_params, seed=seed)
@@ -5884,6 +6337,74 @@ def _skin_img_url(weapon: Dict[str, Any], skin: Dict[str, Any]) -> str:
     return f"/img/{skin_image_key(weapon, skin)}.png"
 
 
+def _creator_profile(user_id: str) -> Optional[Profile]:
+    """Profil gracza (do blokad rangowych kafli) — None, gdy brak danych."""
+    try:
+        if str(user_id).isdigit():
+            return profile_by_id(int(user_id))
+    except Exception:  # noqa: BLE001 — brak profilu nie może ubić kreatora
+        pass
+    return None
+
+
+def citizen_ui_items(user_id: str = "") -> List[Dict[str, Any]]:
+    """
+    Kafle kreatora citizena. Bot SAM wylicza pod tym spodem:
+      • plik docelowy (`file`) — ścieżka, którą gracz dostanie w paczce,
+      • klucz konfliktu (`key`) — opcje z tym samym kluczem zastępują się,
+      • blokady rangowe (`locked`/`level`).
+    """
+    profile = _creator_profile(user_id)
+    out: List[Dict[str, Any]] = []
+    for step in CITIZEN_STEPS:
+        out.append(creator_item(
+            sid=step["id"], tab=step["group"], name=step["name"],
+            desc=step["description"],
+            file=f"citizen/common/data/{step['gen_file']}",
+            img=_citizen_img_url(step),
+            key=file_key(step),
+            tags=[short_group(step["group"])],
+            locked=is_locked(profile, step),
+            level=min_level_of(step)))
+    return out
+
+
+def skin_ui_items(user_id: str = "") -> List[Dict[str, Any]]:
+    """Kafle skinów: zakładka = broń, klucz = plik .ytd (jeden skin na broń)."""
+    profile = _creator_profile(user_id)
+    out: List[Dict[str, Any]] = []
+    for weapon in all_weapons():
+        for skin in weapon["skins"]:
+            out.append(creator_item(
+                sid=skin["id"], tab=weapon["name"], name=skin["name"],
+                desc=skin.get("description") or f"Wykończenie dla {weapon['name']}.",
+                file=file_key(skin), img=_skin_img_url(weapon, skin),
+                key=file_key(skin), tags=[weapon["name"]],
+                locked=is_locked(profile, skin),
+                level=min_level_of(skin)))
+    return out
+
+
+def creator_ui_items(kind: str, user_id: str = "") -> List[Dict[str, Any]]:
+    """Kafle wybranego kreatora (kind: 'citizen' / 'skins')."""
+    return citizen_ui_items(user_id) if kind == "citizen" else skin_ui_items(user_id)
+
+
+def _creator_items_for_session(sess: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Kafle sesji + ustawienie domyślnej zakładki (żeby odświeżenie jej nie gubiło)."""
+    items = creator_ui_items(str(sess.get("kind", "citizen")), sess.get("user_id", ""))
+    tabs = {i["tab"] for i in items}
+    stored = sess.get("tab")
+    if stored not in tabs and stored != web_creator.BUNDLE_TAB:
+        # Citizen startuje od „Gotowych presetów” (jedno kliknięcie = cały build),
+        # skiny — od pierwszego pistoletu.
+        if sess.get("kind") == "citizen" and items:
+            sess["tab"] = web_creator.BUNDLE_TAB
+        else:
+            sess["tab"] = items[0]["tab"] if items else ""
+    return items
+
+
 async def http_create_home(request: web.Request) -> web.Response:
     """GET /create — start kreatora (wybór: citizen albo skiny)."""
     user_id = request.query.get("user", "anon")
@@ -5922,12 +6443,12 @@ def _expired_page() -> web.Response:
 
 
 async def http_citizen_page(request: web.Request) -> web.Response:
-    """GET /create/citizen/{token}/page — zakładki + siatka wszystkich opcji."""
+    """GET /create/citizen/{token}/page — studio: zakładki + siatka kafli."""
     sess = await _web_session_or_404(request)
     if not sess:
         return _expired_page()
     return web.Response(text=render_citizen_page(
-        request.match_info["token"], sess, CITIZEN_STEPS, _citizen_img_url),
+        request.match_info["token"], sess, _creator_items_for_session(sess)),
         content_type="text/html")
 
 
@@ -5945,9 +6466,12 @@ def _toggle_id(ids: List[str], step_id: str) -> None:
 
 async def http_citizen_action(request: web.Request) -> web.Response:
     """
-    GET /create/citizen/{token}/{action}/{value}
-      action=tab    — przełącz zakładkę (value = slug grupy)
+    GET /create/citizen/{token}/{action}/{value} — fallback bez JavaScriptu.
+      action=tab    — ustaw zakładkę (value = slug grupy)
       action=toggle — wybierz/odznacz opcję (value = id kroku)
+
+    Korzysta z TEJ SAMEJ logiki co API (auto-zastępowanie plików), więc wynik
+    jest identyczny niezależnie od tego, czy gracz ma włączony JS.
     """
     sess = await _web_session_or_404(request)
     if not sess:
@@ -5955,17 +6479,12 @@ async def http_citizen_action(request: web.Request) -> web.Response:
     token = request.match_info["token"]
     action = request.match_info["action"]
     value = request.match_info.get("value") or request.match_info.get("index", "")
+    items = _creator_items_for_session(sess)
     if action == "toggle" and value:
-        step = _citizen_step_by_id(value)
-        if step is not None:
-            _toggle_id(sess["citizen_ids"], value)
-            sess.setdefault("name_cache", {})[value] = str(step["name"])
+        toggle_item(sess, items, value)
         raise web.HTTPFound(f"/create/citizen/{token}/page")
-    if action == "tab":
-        # zakładka: po prostu renderujemy stronę ponownie (grupa w value)
-        return web.Response(text=render_citizen_page(
-            token, sess, CITIZEN_STEPS, _citizen_img_url, group=web_creator.unslug(value)),
-            content_type="text/html")
+    if action == "tab" and value:
+        sess["tab"] = web_creator.unslug(value)
     raise web.HTTPFound(f"/create/citizen/{token}/page")
 
 
@@ -5975,14 +6494,14 @@ async def http_skins_page(request: web.Request) -> web.Response:
     if not sess:
         return _expired_page()
     return web.Response(text=render_skins_page(
-        request.match_info["token"], sess, all_weapons(), _skin_img_url),
+        request.match_info["token"], sess, _creator_items_for_session(sess)),
         content_type="text/html")
 
 
 async def http_skins_action(request: web.Request) -> web.Response:
     """
-    GET /create/skins/{token}/{action}/{value}
-      action=weapon — przełącz zakładkę broni
+    GET /create/skins/{token}/{action}/{value} — fallback bez JavaScriptu.
+      action=weapon — przełącz zakładkę broni (value = id broni)
       action=toggle — wybierz/odznacz skin (value = id skina)
     """
     sess = await _web_session_or_404(request)
@@ -5991,16 +6510,14 @@ async def http_skins_action(request: web.Request) -> web.Response:
     token = request.match_info["token"]
     action = request.match_info["action"]
     value = request.match_info.get("value") or request.match_info.get("index", "")
-    weapons = all_weapons()
+    items = _creator_items_for_session(sess)
     if action == "weapon" and value:
-        sess["weapon"] = value
+        weapon = find_weapon(value)
+        if weapon is not None:
+            sess["weapon"] = value
+            sess["tab"] = weapon["name"]
     elif action == "toggle" and value:
-        skin = next((s for w in weapons for s in w["skins"] if s["id"] == value), None)
-        if skin is not None:
-            _toggle_id(sess["skin_ids"], value)
-            wname = next((w["name"] for w in weapons
-                          if any(s["id"] == value for s in w["skins"])), "")
-            sess.setdefault("name_cache", {})[value] = f"{wname} — {skin['name']}"
+        toggle_item(sess, items, value)
     raise web.HTTPFound(f"/create/skins/{token}/page")
 
 
@@ -6020,6 +6537,10 @@ async def http_create_finish(request: web.Request) -> web.Response:
     workspace = WORKSPACES_DIR / f"web-{sess['user_id']}-{int(time.time())}"
     workspace.mkdir(parents=True, exist_ok=True)
     kind = sess["kind"]
+    # Podsumowanie auto-doboru: co bot scalił i jakie pliki trafiły do paczki.
+    ui_items = creator_ui_items(kind, sess.get("user_id", ""))
+    outputs = output_groups(ui_items, chosen_ids(sess))
+    merged_count = sum(1 for grp in outputs if grp.get("merged"))
     try:
         if kind == "citizen":
             items = [dict(s) for s in CITIZEN_STEPS if s["id"] in sess["citizen_ids"]]
@@ -6054,9 +6575,130 @@ async def http_create_finish(request: web.Request) -> web.Response:
                                  "background:#0b0d13;color:#ed4245;display:grid;place-items:center;"
                                  "height:100vh'><h1>Coś się posypało — spróbuj ponownie.</h1>",
                             content_type="text/html", status=500)
-    return web.Response(text=web_creator.render_pack_done(
-        request.match_info["token"], download_url, kind, file_count, size / (1024 * 1024)),
+    return web.Response(text=render_pack_done(
+        request.match_info["token"], download_url, kind, file_count,
+        size / (1024 * 1024), outputs, merged_count),
         content_type="text/html")
+
+
+# ----------------------------------------------------------------------------
+# API KREATORA (JSON) — natychmiastowy wybór bez przeładowania strony
+# ----------------------------------------------------------------------------
+
+def _expired_json() -> web.Response:
+    return web.json_response({"ok": False, "error": "sesja wygasła — otwórz kreator z bota"},
+                             status=410)
+
+
+async def http_api_creator_state(request: web.Request) -> web.Response:
+    """GET /api/create/<token>/state — pełny stan studia (zakładki, kafle, wybory)."""
+    sess = await _web_session_or_404(request)
+    if not sess:
+        return _expired_json()
+    kind = sess["kind"]
+    return web.json_response(build_state(kind, request.match_info["token"], sess,
+                                         _creator_items_for_session(sess),
+                                         citizen_mods.BUNDLES))
+
+
+async def http_api_creator_toggle(request: web.Request) -> web.Response:
+    """
+    POST /api/create/<token>/toggle  {id}
+
+    Bot sam: blokuje opcje zablokowane rangą, zastępuje opcje piszące do tego
+    samego pliku i mówi, które pliki właśnie scalił z kilku opcji.
+    """
+    sess = await _web_session_or_404(request)
+    if not sess:
+        return _expired_json()
+    kind = sess["kind"]
+    try:
+        data = await request.json()
+    except Exception:  # noqa: BLE001 — zły JSON = brak zmian
+        data = {}
+    items = _creator_items_for_session(sess)
+    result = toggle_item(sess, items, str((data or {}).get("id") or ""))
+    state = build_state(kind, request.match_info["token"], sess, items)
+    return web.json_response({
+        "ok": result.get("ok", False),
+        "error": result.get("error", ""),
+        "added": result.get("added", False),
+        "name": result.get("name", ""),
+        "replaced": result.get("replaced", []),
+        "merged_files": result.get("merged_files", []),
+        "chosen": state["chosen"],
+        "stats": state["stats"],
+    })
+
+
+async def http_api_creator_bundle(request: web.Request) -> web.Response:
+    """
+    POST /api/create/<token>/bundle  {id}
+
+    Nakłada CAŁY gotowy preset (np. „PVP / Tryhard”, „Krwawy Księżyc”): dodaje
+    wszystkie jego opcje, a konflikty rozwiązuje automatycznie — gracz nie
+    klika kilkunastu kafli i nic nie wpisuje.
+    """
+    sess = await _web_session_or_404(request)
+    if not sess:
+        return _expired_json()
+    try:
+        data = await request.json()
+    except Exception:  # noqa: BLE001 — zły JSON = brak zmian
+        data = {}
+    bundle_id = str((data or {}).get("id") or "")
+    bundle = next((b for b in citizen_mods.BUNDLES if b["id"] == bundle_id), None)
+    if bundle is None:
+        return web.json_response({"ok": False, "error": "nieznany preset"})
+    items = _creator_items_for_session(sess)
+    result = apply_bundle(sess, items, bundle.get("steps") or [])
+    state = build_state(sess["kind"], request.match_info["token"], sess, items)
+    return web.json_response({
+        "ok": result.get("ok", False),
+        "added": result.get("added", []),
+        "replaced": result.get("replaced", []),
+        "locked": result.get("locked", []),
+        "merged_files": result.get("merged_files", []),
+        "chosen": state["chosen"],
+        "stats": state["stats"],
+    })
+
+
+async def http_api_creator_tab(request: web.Request) -> web.Response:
+    """POST /api/create/<token>/tab  {tab} — zapamiętuje aktywną zakładkę."""
+    sess = await _web_session_or_404(request)
+    if not sess:
+        return _expired_json()
+    try:
+        data = await request.json()
+    except Exception:  # noqa: BLE001
+        data = {}
+    tab = str((data or {}).get("tab") or "")
+    items = _creator_items_for_session(sess)
+    if tab in {i["tab"] for i in items}:
+        sess["tab"] = tab
+    return web.json_response({"ok": True, "tab": sess.get("tab", "")})
+
+
+async def http_api_creator_clear(request: web.Request) -> web.Response:
+    """POST /api/create/<token>/clear — czyści wszystkie wybory."""
+    sess = await _web_session_or_404(request)
+    if not sess:
+        return _expired_json()
+    clear_items(sess)
+    return web.json_response({"ok": True, "chosen": []})
+
+
+async def http_api_creator_pack(request: web.Request) -> web.Response:
+    """GET /api/create/<token>/pack — co bot zbuduje (pliki + scalenia)."""
+    sess = await _web_session_or_404(request)
+    if not sess:
+        return _expired_json()
+    kind = sess["kind"]
+    state = build_state(kind, request.match_info["token"], sess,
+                        _creator_items_for_session(sess))
+    return web.json_response({"ok": True, "outputs": state["outputs"],
+                              "stats": state["stats"]})
 
 
 def _page_html(title: str, chip: str, main_html: str) -> str:
@@ -6183,6 +6825,13 @@ def create_http_app() -> web.Application:
     app.router.add_get("/create/skins/{token}/{action}/{value}", http_skins_action)
     app.router.add_get("/create/finish/{token}", http_create_finish)  # GET = redirect do kreatora
     app.router.add_post("/create/finish/{token}", http_create_finish)  # POST = buduje paczkę
+    # JSON API studia (natychmiastowy wybór bez przeładowania strony)
+    app.router.add_get("/api/create/{token}/state", http_api_creator_state)
+    app.router.add_post("/api/create/{token}/toggle", http_api_creator_toggle)
+    app.router.add_post("/api/create/{token}/bundle", http_api_creator_bundle)
+    app.router.add_post("/api/create/{token}/tab", http_api_creator_tab)
+    app.router.add_post("/api/create/{token}/clear", http_api_creator_clear)
+    app.router.add_get("/api/create/{token}/pack", http_api_creator_pack)
     app.router.add_get("/api/pack/{token}", http_api_pack)
     app.router.add_get("/api/profile/{user_id}", http_api_profile)
     app.router.add_get("/api/bridge/inbox", http_api_bridge_inbox)
