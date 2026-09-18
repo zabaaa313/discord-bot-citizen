@@ -1,19 +1,29 @@
 """
 ==============================================================================
- GENERATOR PLIKÓW CITIZENA
+ GENERATOR PLIKÓW CITIZENA (na podstawie paczki z citizen.rar)
 ==============================================================================
- Bot BUDUJE pliki paczki na podstawie przeskanowanego, czystego citizena
- (FiveM.app\\citizen). Zasada: TE SAME pliki, tylko ze zmienionymi wartościami.
+ Zasada: TE SAME pliki co w paczce, tylko ze zmienionymi wartościami.
+ Bot nie wymyśla plików od zera — bierze szablony z `citizen_templates/`
+ (skopiowane z citizen.rar: MATOL.xml, timecycle_mods_4.xml, visualsettings.dat,
+ clouds.xml, cloudkeyframes.xml, explosionfx.dat, firefx.dat, entityfx.dat,
+ ui/pausemenu.xml) i patchuje w nich konkretne parametry.
 
- Pliki generowane (dokładna struktura jak w citizen/common/data):
-   • timecycle/sggd.xml          — główne niebo (cycle EXTRASUNNY)
-   • levels/gta5/weather.xml     — pogoda (naprawia broken EXTRASUNNY)
-   • levels/gta5/time.xml        — słońce/księżyc (sun_roll, moon_roll)
-   • visualsettings.dat          — deszcz, chmury, bloom, sun glare
-   • effects/bloodfx.dat         — krew (anime / minimal / brak)
+ Pliki generowane/patchowane (ścieżki jak w citizen/common/data):
+   • timecycle/MATOL.xml              — niebo, chmury, słońce/księżyc, woda,
+                                        mgła, światło, postfx, blur, wydajność
+   • levels/gta5/time.xml             — CZAS (zawsze dzień / zawsze noc / cykl)
+   • levels/gta5/weather.xml          — POGODA (pełny cykl, naprawiony)
+   • visualsettings.dat               — deszcz, cykl pogody, chmury, cienie…
+   • clouds.xml / cloudkeyframes.xml  — geometria i gęstość chmur
+   • timecycle/timecycle_mods_4.xml   — KILL EFFECT (kolor, siła, blur)
+   • effects/bloodfx.dat              — krew (anime / minimalna / brak)
+   • effects/explosionfx.dat          — siła eksplozji, przypalenia
+   • effects/firefx.dat               — czas i siła palenia
+   • effects/entityfx.dat             — dym, para, kurz, cząstki otoczenia
+   • ui/pausemenu.xml                 — HUD / menu pauzy
 
- Nieba NIE są z YouTube — parametry nieba siedzą w sggd.xml i bot je
- ustawia sam (to jest poprawny, techniczny sposób na custom niebo).
+ Nieba NIE są pobierane z YouTube — parametry nieba siedzą w MATOL.xml i bot
+ ustawia je sam, z krzywą dzień/noc (13 kluczy czasowych z paczki).
 ==============================================================================
 """
 
@@ -21,6 +31,9 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+import citizen_mods
+import citizen_patch as cp
 
 # ============================================================================
 # 1. CZYSTE NIEBO — parametry bazowe (przeskane z czystego citizena)
@@ -159,7 +172,7 @@ def sky_preset_params(sky_preset_id: str, extra: Optional[Dict[str, Any]] = None
 # ============================================================================
 
 # Grupy (bez zmian względem starych, żeby nie psuć UX)
-G_SKY = "1️⃣ NIEBO — custom nieba i pogoda"
+G_SKY = "1️⃣ NIEBO — skydome i custom nieba"
 G_TIME = "2️⃣ SŁOŃCE I KSIĘŻYC — kąt, kolor, czas"
 G_POSTFX = "3️⃣ GRAFIKA — bloom, ekspozycja, nasycenie"
 G_WEATHER = "4️⃣ POGODA — deszcz, śnieg, mgła"
@@ -187,93 +200,56 @@ def _gen_step(group: str, sid: str, name: str, desc: str, image: str,
     }
 
 
-CITIZEN_GENERATED_STEPS: List[Dict[str, Any]] = [
-    # ---------- 1. NIEBO (custom nieba — automatycznie ~100 wariantów) ----------
-    # Ręcznie curated 6 + automatyczne warianty z citizen_expand (100 motywów).
-    # Generowane w pętli poniżej listy (see CITIZEN_GENERATED_STEPS += ...).
-    _gen_step(G_SKY, "sky-preset-anime", "Niebo Anime", "Pastelowy błękit + mocne chmury (styl Shinkai).",
-              "SKY_ANIME", "timecycle/sggd.xml", {"sky_preset": "sky-anime"}),
-    _gen_step(G_SKY, "sky-preset-frostpunk", "Niebo Frostpunk", "Zimna szarość i lodowa mgła.",
-              "SKY_FROSTPUNK", "timecycle/sggd.xml", {"sky_preset": "sky-frostpunk"}),
-    _gen_step(G_SKY, "sky-preset-tropical", "Niebo Tropikalne", "Głęboki błękit + złote słońce.",
-              "SKY_TROPICAL", "timecycle/sggd.xml", {"sky_preset": "sky-tropical"}),
-    _gen_step(G_SKY, "sky-preset-bloodmoon", "Krwawy Księżyc", "Ciemna czerwień + wielki księżyc (PVP).",
-              "SKY_BLOODMOON", "timecycle/sggd.xml", {"sky_preset": "sky-bloodmoon"}),
-    _gen_step(G_SKY, "sky-preset-neon", "Neon City", "Cyberpunkowy fiolet + pomarańczowy horyzont.",
-              "SKY_NEON", "timecycle/sggd.xml", {"sky_preset": "sky-neon"}),
-    _gen_step(G_SKY, "sky-preset-clean", "Czyste + FPS", "Naturalne niebo, mniej chmur = więcej FPS.",
-              "SKY_CLEAN", "timecycle/sggd.xml", {"sky_preset": "sky-clean-fps"}),
+CITIZEN_GENERATED_STEPS: List[Dict[str, Any]] = []
 
-    # ---------- 2. SŁOŃCE / KSIĘŻYC / CZAS ----------
-    _gen_step(G_TIME, "sun-always-noon", "Zawsze południe", "Słońce wysoko, stały jasny dzień (sun_roll=0).",
-              "SUN_NOON", "levels/gta5/time.xml", {"sun_roll": 0, "mode": "dynamic"}),
-    _gen_step(G_TIME, "sun-low-golden", "Złota godzina na stałe", "Słońce nisko — wieczorny klimat zawsze.",
-              "SUN_GOLDEN", "levels/gta5/time.xml", {"sun_roll": 78, "mode": "dynamic"}),
-    _gen_step(G_TIME, "moon-huge", "Wielki księżyc", "Duży, jasny księżyc nocą (moon_roll=-60, duży offset).",
-              "MOON_HUGE", "levels/gta5/time.xml", {"moon_roll": -60, "moon_wobble_amp": 0.6}),
+# ------ 1. NIEBO: 6 curated stylów + ~100 motywów (wszystkie piszą MATOL.xml) ---
 
-    # ---------- 3. GRAFIKA (postfx / bloom / exposure) ----------
-    _gen_step(G_POSTFX, "postfx-vivid", "Kolory vivid", "Nasycone kolory (timecycle_mods_4.xml).",
-              "POSTFX_VIVID", "timecycle/timecycle_mods_4.xml", {"style": "vivid"}),
-    _gen_step(G_POSTFX, "postfx-cold", "Klimat zimny", "Zimne, desaturowane kolory (mods_4).",
-              "POSTFX_COLD", "timecycle/timecycle_mods_4.xml", {"style": "cold"}),
-    _gen_step(G_POSTFX, "postfx-film", "Kinowy look", "Filmowa ekspozycja + winieta (mods_4).",
-              "POSTFX_FILM", "timecycle/timecycle_mods_4.xml", {"style": "film"}),
+_SKY_CURATED: Tuple[str, ...] = ("sky-anime", "sky-frostpunk", "sky-tropical",
+                                 "sky-bloodmoon", "sky-neon", "sky-clean-fps")
 
-    # ---------- 4. POGODA ----------
-    _gen_step(G_WEATHER, "weather-always-clear", "Zawsze słonecznie", "Naprawia broken EXTRASUNNY — pełny cycle pogodowy z dominującym słońcem.",
-              "WEATHER_CLEAR", "levels/gta5/weather.xml", {"style": "always-sunny"}),
-    _gen_step(G_WEATHER, "weather-stormy", "Klimat burzowy", "Częste burze i deszcz (cykl pogodowy).",
-              "WEATHER_STORM", "levels/gta5/weather.xml", {"style": "stormy"}),
-    _gen_step(G_WEATHER, "rain-off", "Wyłącz deszcz", "rain.NumberParticles=0 — zero kropel (FPS boost).",
-              "RAIN_OFF", "visualsettings.dat", {"style": "rain-off"}),
-    _gen_step(G_WEATHER, "rain-heavy", "Deszcz mocny", "Więcej cząsteczek deszczu, mokre ulice.",
-              "RAIN_HEAVY", "visualsettings.dat", {"style": "rain-heavy"}),
 
-    # ---------- 5. KOMBAT ----------
-    _gen_step(G_BLOOD, "blood-anime", "Krew ANIME", "Duże tryskanie krwi (bloodfx.dat).",
-              "BLOOD_ANIME", "effects/bloodfx.dat", {"style": "anime"}),
-    _gen_step(G_BLOOD, "blood-minimal", "Krew minimalna", "Małe plamy, mniej efektów.",
-              "BLOOD_MIN", "effects/bloodfx.dat", {"style": "minimal"}),
-    _gen_step(G_BLOOD, "blood-none", "Brak krwi", "Zero efektów krwi (czystszy ekran).",
-              "BLOOD_NONE", "effects/bloodfx.dat", {"style": "none"}),
+def _sky_step(preset_id: str, name: str, desc: str, image: str,
+              step_id: str = "", extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Krok nieba. Parametry presetu (dzień + noc) są wpisane WPROST do kroku,
+    dzięki czemu generator nie musi znać katalogu presetów (brak cyklicznych
+    importów), a scalanie parametrów w proces_items działa jak dla innych plików.
+    """
+    params: Dict[str, Any] = dict(sky_preset_params(preset_id))
+    params["sky_preset"] = preset_id
+    if extra:
+        params.update(extra)
+    if step_id:
+        sid = step_id
+    elif preset_id.startswith("sky-"):
+        sid = f"sky-preset-{preset_id[4:]}"
+    else:
+        sid = preset_id
+    return _gen_step(G_SKY, sid, name, desc, image,
+                     citizen_mods.MOD_FILES["matol"], params)
 
-    # KILL EFFECT — jak wygląda krew w momencie zabicia (SPINE/NECK, BulletLarge)
-    _gen_step(G_BLOOD, "kill-extreme", "💀 Kill: EXTREME", "Ogromny wytrysk krwi przy zabiciu (x3 plamy).",
-              "KILL_EXTREME", "effects/bloodfx.dat", {"kill_style": "extreme"}),
-    _gen_step(G_BLOOD, "kill-strong", "💀 Kill: Strong", "Mocna krew przy zabiciu (x2 plamy).",
-              "KILL_STRONG", "effects/bloodfx.dat", {"kill_style": "strong"}),
-    _gen_step(G_BLOOD, "kill-off", "💀 Kill: Wyłączony", "Bez dodatkowej krwi przy zabiciu.",
-              "KILL_OFF", "effects/bloodfx.dat", {"kill_style": "off"}),
 
-    # HEAD EFFECT — strzał w głowę (wiersz HEAD, NonFatalHeadshot)
-    _gen_step(G_BLOOD, "head-massive", "🎯 Head: MASSIVE", "Spektakularny efekt headshota (x2.5 plamy).",
-              "HEAD_MASSIVE", "effects/bloodfx.dat", {"head_style": "massive"}),
-    _gen_step(G_BLOOD, "head-big", "🎯 Head: Big", "Wyraźny efekt strzału w głowę (x1.7 plamy).",
-              "HEAD_BIG", "effects/bloodfx.dat", {"head_style": "big"}),
-    _gen_step(G_BLOOD, "head-off", "🎯 Head: Wyłączony", "Bez dodatkowego efektu headshota.",
-              "HEAD_OFF", "effects/bloodfx.dat", {"head_style": "off"}),
+for _pid in _SKY_CURATED:
+    _preset = SKY_PRESETS_BY_ID[_pid]
+    CITIZEN_GENERATED_STEPS.append(_sky_step(
+        _pid, _preset["name"], _preset["desc"],
+        "SKY_" + _pid[4:].upper().replace("-", "_")))
 
-    # ---------- 6. DODATKOWE ----------
-    _gen_step(G_MISC, "clouds-off", "Chmury OFF", "Czyste niebo bez chmur (sky_cloud_density_mult=0).",
-              "CLOUDS_OFF", "timecycle/sggd.xml", {"sky_preset": None, "clouds": "off"}),
-    _gen_step(G_MISC, "clouds-dense", "Chmury gęste", "Więcej chmur (dramatyczne niebo).",
-              "CLOUDS_DENSE", "timecycle/sggd.xml", {"sky_preset": None, "clouds": "dense"}),
-]
-
-# --- DOKLEJKA: automatyczne warianty custom nieb (citizen_expand) ---
+# --- ROZBUDOWA do ~100 custom nieb (deterministyczne warianty motywów) ---
 try:
     from citizen_expand import expanded_sky_presets
-    _preset_ids = {p["id"] for p in SKY_PRESETS}
     for _sky in expanded_sky_presets():
-        if _sky["id"] in _preset_ids and not any(
-                s.get("gen_params", {}).get("sky_preset") == _sky["id"]
-                for s in CITIZEN_GENERATED_STEPS):
-            CITIZEN_GENERATED_STEPS.append(_gen_step(
-                G_SKY, f"sky-x-{_sky['id']}", f"Niebo {_sky['name']}", _sky["desc"],
-                _sky["id"].upper(), "timecycle/sggd.xml", {"sky_preset": _sky["id"]}))
-except ImportError:  # pragma: no cover
+        if _sky["id"] not in SKY_PRESETS_BY_ID:
+            continue
+        CITIZEN_GENERATED_STEPS.append(_sky_step(
+            _sky["id"], f"Niebo {_sky['name']}", _sky["desc"],
+            _sky["id"].upper().replace("-", "_"), step_id=f"sky-x-{_sky['id']}"))
+except ImportError:  # pragma: no cover — plik opcjonalny
     pass
+
+# --- 2..17. POZOSTAŁE OPCJE CITIZENA (z citizen_mods: czas, pogoda, woda, mgła,
+#     światło, postfx, blur, kill/head effect, eksplozje, dym, HUD, FPS) ---
+CITIZEN_GENERATED_STEPS += citizen_mods.MOD_STEPS
 
 # ============================================================================
 # 4. GENERATORY — funkcje produkujące zawartość plików
@@ -287,67 +263,45 @@ def _fmt(v: float) -> str:
     return f"{float(v):.4f}"
 
 
-# ---------------------------------------------------------------- sggd.xml --
-def generate_sggd_xml(params: Dict[str, Any]) -> str:
-    """
-    Główne niebo. Buduje pełny <cycle name="EXTRASUNNY"> z parametrami nieba.
-    Struktura zgodna z czystym citizenem (cycle per typ pogody).
-    """
-    sky: Dict[str, float] = dict(BASE_SKY)
-    sky_preset_id = params.get("sky_preset")
-    if sky_preset_id and sky_preset_id in SKY_PRESETS_BY_ID:
-        sky.update(SKY_PRESETS_BY_ID[sky_preset_id]["params"])
-
-    if params.get("clouds") == "off":
-        sky["sky_cloud_density_mult"] = 0.0
-    elif params.get("clouds") == "dense":
-        sky["sky_cloud_density_mult"] = 1.0
-
-    # Kluczowe grupy parametrów nieba (wszystkie 13 slotów czasowych = ta sama wartość
-    # — stabilne niebo przez cały dzień; to robi też czysty citizen).
-    groups = {
-        "sky_zenith_col": ["r", "g", "b"],
-        "sky_horizon_col": ["r", "g", "b"],
-        "sky_azimuth_east_col": ["r", "g", "b"],
-        "sky_azimuth_west_col": ["r", "g", "b"],
-        "sky_azimuth_transition_col": ["r", "g", "b"],
-    }
-
-    def const_line(tag: str, value: float) -> str:
-        vals = " ".join(_fmt(value) for _ in range(13))
-        return f"\t\t\t<{tag}> {vals} </{tag}>"
-
-    lines: List[str] = []
-    lines.append('<?xml version="1.0" encoding="UTF-8"?>')
-    lines.append("<!-- FiveM Mod Foundry — generator nieba (citizen/common/data/timecycle/sggd.xml) -->")
-    lines.append('<CTimeCycleModificationData>')
-    lines.append('\t<cycle name="EXTRASUNNY">')
-
-    # kolory nieba (3 kanały per grupa)
-    for group, channels in groups.items():
-        for ch in channels:
-            key = f"{group}_{ch}"
-            value = sky.get(key, 0.0)
-            inten_key = f"{group}_inten"
-            lines.append(const_line(key, value))
-        lines.append(const_line(f"{group}_inten", sky.get(f"{group}_inten", 1.0)))
-
-    # chmury
-    for key in ("sky_cloud_density_mult", "sky_cloud_gen_frequency", "sky_cloud_gen_scale",
-                "sky_cloud_gen_threshold", "sky_cloud_gen_softness"):
-        lines.append(const_line(key, sky.get(key, 0.0)))
-
-    # księżyc i sunburst
-    lines.append(const_line("sky_moon_iten", sky.get("sky_moon_iten", 0.35)))
-    lines.append(const_line("sky_moon_disc_size", sky.get("sky_moon_disc_size", 1.0)))
-    lines.append(const_line("sky_sunburst_imten", sky.get("sky_sunburst_imten", 1.0)))
-
-    lines.append('\t</cycle>')
-    lines.append('</CTimeCycleModificationData>')
-    return "\n".join(lines) + "\n"
-
-
 # ------------------------------------------------------------- weather.xml --
+# Style pogody: nazwa → wagi typów w cyklu (TimeMult). Zgodne z formatem paczki.
+WEATHER_STYLES: Dict[str, Dict[str, int]] = {
+    "always-sunny": {"EXTRASUNNY": 80, "CLEAR": 20},
+    "always-rain": {"RAIN": 85, "THUNDER": 10, "CLEARING": 5},
+    "stormy": {"EXTRASUNNY": 15, "CLEAR": 10, "CLOUDS": 15, "OVERCAST": 20,
+               "RAIN": 20, "THUNDER": 15, "CLEARING": 5},
+    "always-fog": {"FOGGY": 85, "SMOG": 15},
+    "smog": {"SMOG": 70, "FOGGY": 25, "OVERCAST": 5},
+    "snow": {"SNOW": 65, "BLIZZARD": 25, "SNOWLIGHT": 10},
+    "xmas": {"XMAS": 80, "SNOW": 15, "SNOWLIGHT": 5},
+    "balanced": {"EXTRASUNNY": 30, "CLEAR": 15, "CLOUDS": 10, "OVERCAST": 10,
+                 "RAIN": 10, "THUNDER": 5, "CLEARING": 5, "FOGGY": 5, "SMOG": 5},
+}
+
+_WEATHER_CLOUDS = {
+    "always-sunny": "CLEARclouds", "always-rain": "HEAVYclouds", "stormy": "HEAVYclouds",
+    "always-fog": "SMOGclouds", "smog": "SMOGclouds", "snow": "SNOWYclouds",
+    "xmas": "HALLOWEENclouds", "balanced": "HEAVYclouds",
+}
+
+
+def _weather_weights(style: str) -> Dict[str, int]:
+    """Wagi typów pogody dla danego stylu (0 = typ nie występuje)."""
+    table = WEATHER_STYLES.get(style) or WEATHER_STYLES["balanced"]
+    full = {name: 0 for name in (
+        "EXTRASUNNY", "CLEAR", "CLOUDS", "SMOG", "FOGGY", "OVERCAST", "RAIN",
+        "THUNDER", "CLEARING", "NEUTRAL", "SNOW", "BLIZZARD", "SNOWLIGHT",
+        "XMAS", "HALLOWEEN")}
+    full.update(table)
+    return full
+
+
+def _cloud_set_for_weather(style: str) -> str:
+    """Domyślne chmury dla stylu pogody (CloudSettingsName z paczki)."""
+    return _WEATHER_CLOUDS.get(style, "HEAVYclouds")
+
+
+
 def generate_weather_xml(params: Dict[str, Any]) -> str:
     """
     Pogoda. WAŻNE: czysty citizen ma BROKEN weather.xml — jest tam tylko
@@ -358,18 +312,7 @@ def generate_weather_xml(params: Dict[str, Any]) -> str:
 
     # Pełny zestaw typów pogody GTA V z wagami (prawdopodobieństwami) per styl
     # weight = jak często dany typ pada w cyklu
-    if style == "always-sunny":
-        weights = {"EXTRASUNNY": 80, "CLEAR": 15, "CLOUDS": 5, "SMOG": 0, "FOGGY": 0,
-                   "OVERCAST": 0, "RAIN": 0, "THUNDER": 0, "CLEARING": 0, "NEUTRAL": 0, "SNOW": 0, "BLIZZARD": 0,
-                   "SNOWLIGHT": 0, "XMAS": 0, "HALLOWEEN": 0}
-    elif style == "stormy":
-        weights = {"EXTRASUNNY": 15, "CLEAR": 10, "CLOUDS": 15, "OVERCAST": 20,
-                   "RAIN": 20, "THUNDER": 15, "CLEARING": 5, "FOGGY": 0, "SMOG": 0,
-                   "NEUTRAL": 0, "SNOW": 0, "BLIZZARD": 0, "SNOWLIGHT": 0, "XMAS": 0, "HALLOWEEN": 0}
-    else:  # balanced
-        weights = {"EXTRASUNNY": 30, "CLEAR": 15, "CLOUDS": 10, "OVERCAST": 10,
-                   "RAIN": 10, "THUNDER": 5, "CLEARING": 5, "FOGGY": 5, "SMOG": 5,
-                   "NEUTRAL": 0, "SNOW": 0, "BLIZZARD": 0, "SNOWLIGHT": 0, "XMAS": 0, "HALLOWEEN": 0}
+    weights = _weather_weights(style)
 
     # Uproszczony opis każdego typu (to NIE jest pełny weather.xml R*, ale
     # spójny i poprawny XML — poprawia broken EXTRASUNNY)
@@ -440,8 +383,8 @@ def generate_weather_xml(params: Dict[str, Any]) -> str:
         lines.append(f'    <MistSettingName>-</MistSettingName>')
         lines.append(f'    <GroundSettingName>-</GroundSettingName>')
         # cykl: waga danego typu = szansa wystąpienia (TimeMult)
-        lines.append(f'    <TimeCycleFilename>COMMON:/DATA/TIMECYCLE/sggd.xml</TimeCycleFilename>')
-        lines.append(f'    <CloudSettingsName>HALLOWEENclouds</CloudSettingsName>')
+        lines.append(f'    <TimeCycleFilename>COMMON:/DATA/TIMECYCLE/MATOL.XML</TimeCycleFilename>')
+        lines.append(f'    <CloudSettingsName>{_cloud_set_for_weather(style)}</CloudSettingsName>')
         lines.append('  </Item>')
 
     lines.append('  </WeatherTypes>')
@@ -477,106 +420,6 @@ def generate_time_xml(params: Dict[str, Any]) -> str:
         f'moon_wobble_amp="{_fmt(moon_amp)}" moon_wobble_offset="0.375"/>',
         '  <sample name="00:00" hour="0" duration="4" uw_tc_mod="underwater"/>',
         '</time_data>',
-    ]) + "\n"
-
-
-# -------------------------------------------------------- visualsettings.dat --
-def generate_visualsettings_dat(params: Dict[str, Any]) -> str:
-    """Deszcz / pogoda detale. Struktura: 'sekcja.wartosc liczba' jak w R*."""
-    style = params.get("style", "default")
-    if style == "rain-off":
-        rain_particles = 0
-        rain_alpha = 0.0
-        puddle = 0.0
-    elif style == "rain-heavy":
-        rain_particles = 1200
-        rain_alpha = 1.0
-        puddle = 1.0
-    else:
-        rain_particles = 500
-        rain_alpha = 0.7
-        puddle = 0.5
-
-    lines: List[str] = []
-    lines.append("<!-- FiveM Mod Foundry — generator visualsettings.dat -->")
-    lines.append("")
-    lines.append(f"rain.NumberParticles {rain_particles}")
-    lines.append("rain.UseLitShader 1")
-    lines.append("rain.gravity.x 0")
-    lines.append("rain.gravity.y 0")
-    lines.append("rain.gravity.z -1")
-    lines.append(f"rain.fadeInScale {rain_alpha}")
-    lines.append(f"rain.diffuse {rain_alpha}")
-    lines.append(f"rain.ambient {rain_alpha}")
-    lines.append("rain.wrapScale 0")
-    lines.append("rain.wrapBias 0")
-    lines.append("rain.defaultlight.red 0.8")
-    lines.append("rain.defaultlight.green 0.8")
-    lines.append("rain.defaultlight.blue 0.85")
-    lines.append("rain.defaultlight.alpha 1")
-    lines.append("")
-    lines.append(f"puddle.createdist {puddle}")
-    lines.append(f"puddle.raindist {puddle}")
-    lines.append(f"puddle.amount {puddle}")
-    lines.append(f"puddle.reflection {puddle}")
-    lines.append("")
-    lines.append("sky.sun.centreStart 0.5")
-    lines.append("sky.sun.centreEnd 1.0")
-    lines.append("sky.cloudWarp 1.0")
-    lines.append("sky.cloudInscatteringRange 1000.0")
-    lines.append("sky.cloudEdgeSmooth 100.0")
-    lines.append("sky.GameCloudSpeed 1.0")
-    lines.append("")
-    return "\n".join(lines) + "\n"
-
-
-# ------------------------------------------------ timecycle_mods_4.xml --
-# Czysty citizen ma w timecycle_mods_4.xml jeden modifier 'hud_def_desat_cold_kill'
-# (winieta + tonemapping). Bot nadpisuje go własnymi stylami look'u gry.
-
-def _mods4_modifier(name: str, entries: List[Tuple[str, float]]) -> str:
-    """Pojedynczy <modifier> w formacie timecycle_mods_4 (wartość + delta 0.000)."""
-    body = "".join(
-        f"    <{tag}>{_fmt(val)} 0.000</{tag}>\n" for tag, val in entries
-    )
-    return (f'  <modifier name="{name}" numMods="{len(entries)}" userFlags="0">\n'
-            f"{body}  </modifier>\n")
-
-
-def generate_timecycle_mods4_xml(params: Dict[str, Any]) -> str:
-    """Globalny look gry: vivid / cold / film (struktura jak oryginalny mods_4)."""
-    style = params.get("style", "vivid")
-    if style == "vivid":
-        entries = [
-            ("postfx_correct_col_r", 1.10), ("postfx_correct_col_g", 1.08), ("postfx_correct_col_b", 1.02),
-            ("postfx_decontrast", -0.15), ("postfx_bright", 0.02), ("postfx_exposure", 0.10),
-            ("postfx_intensity_bloom", 0.25),
-        ]
-        name = "foundry_vivid"
-    elif style == "cold":
-        entries = [
-            ("postfx_correct_col_r", 0.92), ("postfx_correct_col_g", 1.00), ("postfx_correct_col_b", 1.12),
-            ("postfx_desat", 0.25), ("postfx_exposure", -0.05),
-            ("postfx_vignetting_intensity", 0.60), ("postfx_vignetting_radius", 10.0),
-        ]
-        name = "foundry_cold"
-    else:  # film
-        entries = [
-            ("postfx_exposure", -0.08),
-            ("postfx_tonemap_filmic_a", 4.0), ("postfx_tonemap_filmic_b", 0.30),
-            ("postfx_tonemap_filmic_c", 0.64), ("postfx_tonemap_filmic_d", 0.384),
-            ("postfx_tonemap_filmic_e", 0.01), ("postfx_tonemap_filmic_f", 0.10),
-            ("postfx_tonemap_filmic_w", 4.0),
-            ("postfx_vignetting_intensity", 1.0), ("postfx_vignetting_radius", 11.5),
-            ("postfx_vignetting_contrast", 0.04),
-        ]
-        name = "foundry_film"
-    return "\n".join([
-        '<?xml version="1.0" encoding="UTF-8"?>',
-        "<!-- FiveM Mod Foundry — generator look'u gry (timecycle_mods_4.xml) -->",
-        '<timecycle_modifier_data version="1.000000">',
-        _mods4_modifier(name, entries).rstrip("\n"),
-        '</timecycle_modifier_data>',
     ]) + "\n"
 
 
@@ -687,12 +530,23 @@ def generate_bloodfx_dat(params: Dict[str, Any]) -> str:
 # ============================================================================
 
 _GENERATORS = {
-    "timecycle/sggd.xml": generate_sggd_xml,
-    "timecycle/timecycle_mods_4.xml": generate_timecycle_mods4_xml,
+    # --- patchowane pliki z paczki (te same pliki, zmienione wartości) ---
+    "timecycle/MATOL.xml": citizen_mods.generate_matol_xml,
+    "timecycle/timecycle_mods_4.xml": citizen_mods.generate_mods4_xml,
+    "visualsettings.dat": citizen_mods.generate_visualsettings_dat,
+    "clouds.xml": citizen_mods.generate_clouds_xml,
+    "cloudkeyframes.xml": citizen_mods.generate_cloudkeyframes_xml,
+    "effects/explosionfx.dat": citizen_mods.generate_explosionfx_dat,
+    "effects/firefx.dat": citizen_mods.generate_firefx_dat,
+    "effects/entityfx.dat": citizen_mods.generate_entityfx_dat,
+    "ui/pausemenu.xml": citizen_mods.generate_pausemenu_xml,
+    "effects/bloodfx.dat": citizen_mods.generate_bloodfx_dat,
+    "effects/weaponfx.dat": citizen_mods.generate_weaponfx_dat,
+    "effects/wheelfx.dat": citizen_mods.generate_wheelfx_dat,
+    "effects/decals.dat": citizen_mods.generate_decals_dat,
+    # --- pliki budowane w całości (małe, w pełni znany format) ---
+    "levels/gta5/time.xml": citizen_mods.generate_time_xml,
     "levels/gta5/weather.xml": generate_weather_xml,
-    "levels/gta5/time.xml": generate_time_xml,
-    "visualsettings.dat": generate_visualsettings_dat,
-    "effects/bloodfx.dat": generate_bloodfx_dat,
 }
 
 
