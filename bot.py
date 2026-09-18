@@ -34,11 +34,14 @@ import os
 import random
 import re
 import shutil
+import struct
 import sys
+import threading
 import time
 import traceback
 import zipfile
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from logging.handlers import RotatingFileHandler
@@ -710,7 +713,27 @@ footer{color:var(--muted);font-size:12px;padding:22px;text-align:center}
 img_log = log("Podglady")
 PREVIEW_W, PREVIEW_H = 640, 360
 BLOOK = 4  # rozmiar bloku renderowania podglądów (4x4 px = gładko i szybko)
+# Podglądy w galeriach są małe (kafel ma ~230-480 px szerokości), więc zapisujemy
+# je w 75% rozmiaru renderu. Kafel waży ~3x mniej i wczytuje się ~3x szybciej,
+# a oko nie widzi różnicy (patrz test "podglad jest zoptymalizowany").
+PREVIEW_OUT_SCALE = float(os.getenv("PREVIEW_OUT_SCALE") or "0.75")
+# Wersja katalogu cache podglądów: nowy filtr PNG + mniejszy rozmiar.
+# Stara wersja (cache/step_previews) jest jednorazowo przeliczana w tle.
+PREVIEW_CACHE_VERSION = "step_previews_v2"
 _IMAGE_CACHE: Dict[str, bytes] = {}
+# Równoległe rendery podglądów (poza pętlą zdarzeń) — serwer zostaje responsywny,
+# gdy pierwszy gracz otwiera zakładkę z 100+ kaflami.
+_PREVIEW_THREADS = max(2, int(os.getenv("PREVIEW_THREADS") or "4"))
+_PREVIEW_POOL = ThreadPoolExecutor(max_workers=_PREVIEW_THREADS, thread_name_prefix="preview")
+_preview_gate: Optional[asyncio.Semaphore] = None
+
+
+def preview_gate() -> asyncio.Semaphore:
+    """Limit jednoczesnych renderów podglądów (leniwe tworzenie — wymaga pętli)."""
+    global _preview_gate
+    if _preview_gate is None:
+        _preview_gate = asyncio.Semaphore(_PREVIEW_THREADS)
+    return _preview_gate
 
 # Palety kroków citizena: (niebo, ziemia, akcent) — pokazują efekt opcji.
 STEP_COLORS: Dict[str, Tuple[str, str, str]] = {
@@ -774,15 +797,70 @@ def _mix(first: Tuple[int, int, int], second: Tuple[int, int, int],
     return tuple(int(first[i] + (second[i] - first[i]) * ratio) for i in range(3))  # type: ignore[return-value]
 
 
-def png_encode(rows: Sequence[Sequence[Tuple[int, int, int]]]) -> bytes:
-    """Koduje piksele RGB do PNG (zlib + CRC) — bez Pillow, czysty stdlib."""
+def _row_bytes(row: Sequence[Tuple[int, int, int]]) -> bytes:
+    """Wiersz pikseli RGB jako bajty (szybkie — konwersja w C, bez pętli po pikselach)."""
+    return b"".join(bytes(px) for px in row)
+
+
+def png_downscale(rows: Sequence[Sequence[Tuple[int, int, int]]],
+                  factor: float) -> List[List[Tuple[int, int, int]]]:
+    """
+    Pomniejszenie obrazu metodą pudełkową (średnia z bloku).
+
+    Podgląd renderujemy w pełnej rozdzielczości (ładniejsze krawędzie słońca
+    i chmur), a zapisujemy mniejszy — dzięki temu kafel w galerii waży ~3x
+    mniej bajtów i tyle samo szybciej się wczytuje.
+    """
+    if factor >= 0.999 or not rows:
+        return list(rows)
+    height, width = len(rows), len(rows[0])
+    if not height or not width:
+        return list(rows)
+    new_h = max(1, int(height * factor))
+    new_w = max(1, int(width * factor))
+    if new_h == height and new_w == width:
+        return list(rows)
+    out: List[List[Tuple[int, int, int]]] = []
+    for ty in range(new_h):
+        y0 = ty * height // new_h
+        y1 = max(y0 + 1, (ty + 1) * height // new_h)
+        line: List[Tuple[int, int, int]] = []
+        for tx in range(new_w):
+            x0 = tx * width // new_w
+            x1 = max(x0 + 1, (tx + 1) * width // new_w)
+            red = green = blue = count = 0
+            for yy in range(y0, y1):
+                src = rows[yy]
+                for xx in range(x0, x1):
+                    pixel = src[xx]
+                    red += pixel[0]
+                    green += pixel[1]
+                    blue += pixel[2]
+                    count += 1
+            line.append((red // count, green // count, blue // count))
+        out.append(line)
+    return out
+
+
+def png_encode(rows: Sequence[Sequence[Tuple[int, int, int]]],
+               scale: Optional[float] = None) -> bytes:
+    """
+    Koduje piksele RGB do PNG (zlib + CRC) — bez Pillow, czysty stdlib.
+
+    Filtr „Up” (2) zamiast „brak” (0): niebo to pionowy gradient, więc różnice
+    między sąsiednimi wierszami są malutkie i zlib kompresuje je ~2.5x lepiej.
+    To ten sam obraz, tylko mniejszy plik — a mniejszy plik = szybsza galeria.
+    """
+    rows = png_downscale(rows, PREVIEW_OUT_SCALE if scale is None else scale)
     height = len(rows)
     width = len(rows[0]) if height else 0
     raw = bytearray()
+    previous = bytes(width * 3)
     for row in rows:
-        raw.append(0)  # filtr 0 = brak
-        for pixel in row:
-            raw.extend(pixel)
+        line = _row_bytes(row)
+        raw.append(2)  # filtr 2 = Up (różnica względem wiersza wyżej)
+        raw += bytes((a - b) & 255 for a, b in zip(line, previous))
+        previous = line
 
     def chunk(kind: bytes, data: bytes) -> bytes:
         return (len(data).to_bytes(4, "big") + kind + data
@@ -791,6 +869,76 @@ def png_encode(rows: Sequence[Sequence[Tuple[int, int, int]]]) -> bytes:
     header = (width.to_bytes(4, "big") + height.to_bytes(4, "big") + bytes([8, 2, 0, 0, 0]))
     return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header)
             + chunk(b"IDAT", zlib.compress(bytes(raw), 6)) + chunk(b"IEND", b""))
+
+
+def png_meta(data: bytes) -> Tuple[int, int]:
+    """Rozmiar PNG (bez dekodowania pikseli) — do statystyk i migracji cache."""
+    if len(data) < 24 or data[:8] != b"\x89PNG\r\n\x1a\n":
+        return 0, 0
+    return (int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big"))
+
+
+def png_decode_rows(data: bytes) -> Optional[List[List[Tuple[int, int, int]]]]:
+    """
+    Rozpakowuje PNG RGB 8-bit (wszystkie filtry) do wierszy pikseli.
+
+    Używane tylko przez jednorazową migrację starego cache podglądów, żeby nie
+    renderować 278 obrazków od zera po aktualizacji.
+    """
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        return None
+    pos, idat, width, height, depth, colour = 8, bytearray(), 0, 0, 0, 0
+    while pos + 8 <= len(data):
+        (length,) = struct.unpack(">I", data[pos:pos + 4])
+        kind = data[pos + 4:pos + 8]
+        body = data[pos + 8:pos + 8 + length]
+        if kind == b"IHDR":
+            width, height, depth, colour = struct.unpack(">IIBB", body[:10])
+        elif kind == b"IDAT":
+            idat += body
+        elif kind == b"IEND":
+            break
+        pos += 12 + length
+    if not width or not height or depth != 8 or colour != 2:
+        return None
+    try:
+        raw = zlib.decompress(bytes(idat))
+    except zlib.error:
+        return None
+    stride = width * 3
+    rows: List[List[Tuple[int, int, int]]] = []
+    prev = bytearray(stride)
+    for y in range(height):
+        start = y * (stride + 1)
+        if start + stride > len(raw):
+            return None
+        filt = raw[start]
+        line = bytearray(raw[start + 1:start + 1 + stride])
+        if filt == 1:
+            for i in range(3, stride):
+                line[i] = (line[i] + line[i - 3]) & 255
+        elif filt == 2:
+            for i in range(stride):
+                line[i] = (line[i] + prev[i]) & 255
+        elif filt == 3:
+            for i in range(stride):
+                left = line[i - 3] if i >= 3 else 0
+                line[i] = (line[i] + ((left + prev[i]) >> 1)) & 255
+        elif filt == 4:
+            for i in range(stride):
+                left = line[i - 3] if i >= 3 else 0
+                up = prev[i]
+                up_left = prev[i - 3] if i >= 3 else 0
+                estimate = left + up - up_left
+                pa, pb, pc = (abs(estimate - left), abs(estimate - up),
+                              abs(estimate - up_left))
+                pred = left if (pa <= pb and pa <= pc) else (up if pb <= pc else up_left)
+                line[i] = (line[i] + pred) & 255
+        elif filt != 0:
+            return None
+        prev = line
+        rows.append([tuple(line[x * 3:x * 3 + 3]) for x in range(width)])
+    return rows
 
 
 def _rect(buf: List[List[Tuple[int, int, int]]], x0: int, y0: int, x1: int, y1: int,
@@ -1480,38 +1628,166 @@ def _step_seed(step: Dict[str, Any]) -> int:
     return zlib.crc32(str(step.get("id", "")).encode())
 
 
+# Katalog podglądów (wersjonowany) + blokady, żeby dwóch graczy nie renderowało
+# tego samego obrazka równolegle po restarcie bota.
+PREVIEW_DIR = CACHE_DIR / PREVIEW_CACHE_VERSION
+LEGACY_PREVIEW_DIR = CACHE_DIR / "step_previews"
+_PREVIEW_LOCKS: Dict[str, threading.Lock] = {}
+_PREVIEW_LOCKS_GUARD = threading.Lock()
+
+
+def _preview_lock(key: str) -> threading.Lock:
+    with _PREVIEW_LOCKS_GUARD:
+        lock = _PREVIEW_LOCKS.get(key)
+        if lock is None:
+            lock = _PREVIEW_LOCKS[key] = threading.Lock()
+        return lock
+
+
+def write_preview(path: Path, data: bytes) -> bool:
+    """Zapis podglądu na dysk (błąd dysku nie może ubić renderu)."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        return True
+    except OSError:  # noqa: BLE001 — brak miejsca/praw = działamy dalej z pamięci
+        return False
+
+
+def convert_preview(data: bytes) -> Optional[bytes]:
+    """Stary podgląd (filtr 0, pełny rozmiar) → nowy format (mniejszy, filtr Up)."""
+    rows = png_decode_rows(data)
+    if rows is None:
+        return None
+    return png_encode(rows)
+
+
 def step_image(step: Dict[str, Any]) -> bytes:
     """
-    PNG podglądu kroku citizena (cache w pamięci + DYSKOWY cache/step_previews).
+    PNG podglądu kroku citizena (pamięć → dysk `cache/step_previews_v2` → render).
     KAŻDY krok pokazuje efekt TAK JAK W GRZE, na wspólnym rendererze sky_png:
       • nieba         — kolory zenith/horizon/azimuth + chmury + księżyc z sggd
       • słońce/księżyc— pozycja tarczy / wielkość księżyca
       • pogoda        — zachmurzenie, burza, deszcz
       • postfx        — grading vivid/cold/film na całej scenie
       • kombat        — plamy krwi na ziemi (kill) i w powietrzu (headshot)
-    Render jest kosztowny (~2-4 s), dlatego wynik zapisujemy na dysku —
-    po restarcie bota podglądy ładują się natychmiast.
+
+    Render jest kosztowny (~2-4 s), więc wynik zapisujemy na dysku w wersji
+    pomniejszonej i mocniej skompresowanej — kafel waży ~3x mniej, a po restarcie
+    bota podglądy ładują się z dysku w milisekundach.
     """
     key = step_image_key(step)
     cached = _IMAGE_CACHE.get(key)
     if cached is not None:
         return cached
 
-    disk = CACHE_DIR / "step_previews" / f"{key}.png"
+    disk = PREVIEW_DIR / f"{key}.png"
     if disk.exists():
         data = disk.read_bytes()
         if data[:4] == b"\x89PNG":
             _IMAGE_CACHE[key] = data
             return data
 
-    png = _render_step_image(step)
-    _IMAGE_CACHE[key] = png
+    with _preview_lock(key):
+        cached = _IMAGE_CACHE.get(key)  # inny wątek mógł już zdążyć policzyć
+        if cached is not None:
+            return cached
+
+        legacy = LEGACY_PREVIEW_DIR / f"{key}.png"
+        if legacy.exists():            # cache ze starszej wersji — przeliczamy
+            try:
+                converted = convert_preview(legacy.read_bytes())
+            except OSError:
+                converted = None
+            if converted is not None:
+                _IMAGE_CACHE[key] = converted
+                write_preview(disk, converted)
+                return converted
+
+        png = _render_step_image(step)
+        _IMAGE_CACHE[key] = png
+        write_preview(disk, png)
+        return png
+
+
+def preview_cache_stats() -> Dict[str, int]:
+    """Ile podglądów jest policzonych w pamięci / na dysku (dla /api/stats)."""
     try:
-        disk.parent.mkdir(parents=True, exist_ok=True)
-        disk.write_bytes(png)
-    except OSError:  # noqa: BLE001 — brak dysku nie może ubić renderu
-        pass
-    return png
+        on_disk = sum(1 for _ in PREVIEW_DIR.glob("*.png"))
+    except OSError:
+        on_disk = 0
+    return {"memory": len(_IMAGE_CACHE), "disk": on_disk, "steps": len(CITIZEN_STEPS)}
+
+
+def migrate_preview_cache() -> int:
+    """
+    Jednorazowe przeliczenie starego cache podglądów (`cache/step_previews`)
+    na nowy format: mniejszy obraz + filtr Up. Dzięki temu po aktualizacji bot
+    nie renderuje 278 obrazków od zera — konwertuje gotowe w ~1 minutę.
+    """
+    if not LEGACY_PREVIEW_DIR.exists():
+        return 0
+    converted = 0
+    for path in sorted(LEGACY_PREVIEW_DIR.glob("*.png")):
+        target = PREVIEW_DIR / path.name
+        if target.exists():
+            continue
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        new_data = convert_preview(data)
+        if new_data is None or not write_preview(target, new_data):
+            continue
+        converted += 1
+    if converted:
+        img_log.info("Przeliczono %s podglądów na nowy (mniejszy) format.", converted)
+    return converted
+
+
+def prewarm_previews() -> int:
+    """
+    Dogrzanie podglądów w tle: brakujące obrazki renderują się zanim gracz
+    otworzy zakładkę, więc kafle pojawiają się od razu (a nie po 2-4 s każdy).
+    """
+    rendered = 0
+    for step in CITIZEN_STEPS:
+        key = step_image_key(step)
+        if key in _IMAGE_CACHE or (PREVIEW_DIR / f"{key}.png").exists():
+            continue
+        if (LEGACY_PREVIEW_DIR / f"{key}.png").exists():
+            continue                    # migracja zajmie się tym plikiem
+        try:
+            step_image(step)
+            rendered += 1
+        except Exception as exc:  # noqa: BLE001 — dogrzewanie nie może ubić bota
+            img_log.warning("Nie dogrzano podglądu %s: %s", step.get("id"), exc)
+            continue
+        time.sleep(0.05)                # oddychamy — pętla zdarzeń i gracze mają priorytet
+    if rendered:
+        img_log.info("Dogrzano %s podglądów kroków citizena.", rendered)
+    return rendered
+
+
+def start_preview_worker() -> Optional[threading.Thread]:
+    """
+    Wątek w tle: najpierw konwertuje stary cache, potem dogrzewa brakujące
+    podglądy. Sterowanie: PREWARM_PREVIEWS=0 wyłącza (np. na słabym VPS-ie).
+    """
+    if str(os.getenv("PREWARM_PREVIEWS", "1")).strip().lower() in {"0", "false", "no", "off"}:
+        img_log.info("Dogrzewanie podglądów wyłączone (PREWARM_PREVIEWS=0).")
+        return None
+
+    def worker() -> None:
+        try:
+            migrate_preview_cache()
+            prewarm_previews()
+        except Exception as exc:  # noqa: BLE001
+            img_log.warning("Dogrzewanie podglądów przerwane: %s", exc)
+
+    thread = threading.Thread(target=worker, name="preview-warmup", daemon=True)
+    thread.start()
+    return thread
 
 
 # ---------------------------------------------------------------------------
@@ -1674,6 +1950,23 @@ def image_bytes_for(key: str) -> Optional[bytes]:
                 if skin_image_key(weapon, skin) == clean:
                     return skin_image(weapon, skin)
     return None
+
+
+async def image_bytes_async(key: str) -> Optional[bytes]:
+    """
+    Podgląd policzony poza pętlą zdarzeń.
+
+    Render nieba to 2-4 s pracy w Pythonie — gdyby liczył się w wątku serwera,
+    w tym czasie strona i wybory gracza STAŁYBY w miejscu. Tutaj render idzie do
+    puli wątków (max PREVIEW_THREADS naraz), a serwer dalej obsługuje kliknięcia.
+    """
+    clean = _safe_key(str(key).replace(".png", ""))
+    cached = _IMAGE_CACHE.get(clean)
+    if cached is not None:
+        return cached
+    loop = asyncio.get_running_loop()
+    async with preview_gate():
+        return await loop.run_in_executor(_PREVIEW_POOL, image_bytes_for, key)
 
 
 def public_image_url(key: str) -> str:
@@ -6297,12 +6590,23 @@ async def http_download(request: web.Request) -> web.StreamResponse:
 
 
 async def http_image(request: web.Request) -> web.Response:
-    """GET /img/<klucz>.png — generowany podgląd kroku citizena lub skina broni."""
-    data = image_bytes_for(request.match_info.get("key", ""))
+    """
+    GET /img/<klucz>.png — podgląd kroku citizena lub skina broni.
+
+    Szybkie, bo:
+      • render idzie do puli wątków (nie blokuje innych żądań),
+      • wynik leży w pamięci i na dysku (kolejne wejścia = natychmiast),
+      • ETag + długi Cache-Control — przeglądarka bierze obrazek z własnego cache
+        i po odświeżeniu strony dostaje tylko 304 (zero bajtów obrazka).
+    """
+    data = await image_bytes_async(request.match_info.get("key", ""))
     if not data:
         return web.Response(text="404: brak podglądu", status=404)
-    return web.Response(body=data, content_type="image/png",
-                        headers={"Cache-Control": "public, max-age=86400"})
+    etag = '"%s"' % hashlib.sha1(data).hexdigest()[:20]
+    headers = {"Cache-Control": "public, max-age=604800, immutable", "ETag": etag}
+    if request.headers.get("If-None-Match") == etag:
+        return web.Response(status=304, headers=headers)
+    return web.Response(body=data, content_type="image/png", headers=headers)
 
 
 async def http_preview(request: web.Request) -> web.Response:
@@ -6801,6 +7105,7 @@ async def http_api_stats(request: web.Request) -> web.Response:
         "steps": len(CITIZEN_STEPS),
         "weapons": len(all_weapons()),
         "packs_issued": len(PACK_TOKENS),
+        "previews": preview_cache_stats(),
         "queue": {"waiting": queue["waiting"], "running": queue["running"],
                   "completed": queue["completed"], "failed": queue["failed"]},
         "cache": {"files": FILE_CACHE.stats()["files"],
@@ -6809,9 +7114,43 @@ async def http_api_stats(request: web.Request) -> web.Response:
     })
 
 
+# Typy odpowiedzi, które warto kompresować (HTML studia = 167 kB -> 24 kB).
+_GZIP_TYPES = ("text/html", "text/plain", "text/css", "application/json",
+               "application/javascript", "text/javascript", "image/svg+xml")
+_GZIP_MIN_BYTES = 900
+
+
+@web.middleware
+async def gzip_middleware(request: web.Request, handler) -> web.StreamResponse:
+    """
+    Kompresja stron i JSON (gzip). Strona studia to głównie JSON stanu i arkusze
+    stylów — po kompresji schodzi z ~166 kB do ~25 kB, więc ładuje się kilka razy
+    szybciej, zwłaszcza na telefonie i słabym łączu.
+    """
+    response = await handler(request)
+    if not isinstance(response, web.Response) or response.body is None:
+        return response
+    if response.headers.get("Content-Encoding"):
+        return response
+    ctype = (response.content_type or "").split(";")[0].strip().lower()
+    if ctype not in _GZIP_TYPES or len(response.body) < _GZIP_MIN_BYTES:
+        return response
+    if "gzip" not in request.headers.get("Accept-Encoding", "").lower():
+        return response
+    packed = zlib.compress(response.body, 5)
+    if len(packed) >= len(response.body):
+        return response
+    response.body = packed
+    response.headers["Content-Encoding"] = "gzip"
+    response.headers["Vary"] = "Accept-Encoding"
+    if "Content-Length" in response.headers:
+        del response.headers["Content-Length"]  # aiohttp policzy je od nowa
+    return response
+
+
 def create_http_app() -> web.Application:
     """Tworzy aplikację aiohttp z trasami bota."""
-    app = web.Application()
+    app = web.Application(middlewares=[gzip_middleware])
     app.router.add_get("/health", http_health)
     app.router.add_get("/download/{token}", http_download)
     app.router.add_get("/preview/{token}", http_preview)
@@ -7188,6 +7527,10 @@ class FoundryBot(discord.Client):
                 "u graczy, więc paczki i podglądy polecą jako załączniki Discorda. "
                 "Ustaw PUBLIC_URL na publiczny adres bota, aby działały zwykłe linki.",
                 PUBLIC_URL)
+
+        # 1b. Dogrzewanie podglądów w tle (konwersja starego cache + render brakujących),
+        #     żeby pierwszy gracz nie czekał na obrazki kafli.
+        start_preview_worker()
 
         # 2. Komendy slash
         try:
