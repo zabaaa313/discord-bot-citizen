@@ -36,33 +36,61 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 TEMPLATE_DIR = Path(__file__).parent / "citizen_templates"
 
+# Szablony są też WKLEJONE w citizen_templates_data.py, więc bot działa z samych
+# plików .py — folder `citizen_templates/` jest opcjonalny (jeśli istnieje, ma
+# pierwszeństwo: łatwiej podmienić pojedynczy szablon).
+try:  # pragma: no cover — brak modułu = korzystamy tylko z folderu
+    import citizen_templates_data as _embedded
+    if not getattr(_embedded, "DATA", None):
+        _embedded = None
+    # noqa: SIM105
+except Exception:  # noqa: BLE001
+    _embedded = None
+
 # ---------------------------------------------------------------------------
 # 0. WCZYTYWANIE SZABLONÓW
 # ---------------------------------------------------------------------------
 
 
 def template_exists(rel: str) -> bool:
-    return (TEMPLATE_DIR / rel).is_file()
+    if (TEMPLATE_DIR / rel).is_file():
+        return True
+    return bool(_embedded is not None and rel in _embedded.DATA)
 
 
 @lru_cache(maxsize=64)
 def load(rel: str) -> Optional[str]:
     """
     Zwraca treść szablonu (bez zmiany końców linii — piszemy potem \\r\\n).
-    None, gdy szablon nie istnieje (np. użytkownik nie skopiował folderu).
+
+    Kolejność: folder `citizen_templates/`, a gdy go nie ma — wbudowane dane
+    z `citizen_templates_data.py`. None, gdy szablonu nie ma nigdzie.
     """
     path = TEMPLATE_DIR / rel
-    if not path.is_file():
-        return None
-    return path.read_text(encoding="utf-8", errors="replace")
+    if path.is_file():
+        return path.read_text(encoding="utf-8", errors="replace")
+    if _embedded is not None:
+        return _embedded.template_text(rel)
+    return None
 
 
 def templates_available() -> List[str]:
     """Lista dostępnych szablonów (diagnostyka/testy)."""
-    if not TEMPLATE_DIR.is_dir():
-        return []
-    return sorted(p.relative_to(TEMPLATE_DIR).as_posix()
-                  for p in TEMPLATE_DIR.rglob("*") if p.is_file())
+    if TEMPLATE_DIR.is_dir():
+        return sorted(p.relative_to(TEMPLATE_DIR).as_posix()
+                      for p in TEMPLATE_DIR.rglob("*") if p.is_file())
+    if _embedded is not None:
+        return _embedded.paths()
+    return []
+
+
+def templates_source() -> str:
+    """Skąd bot bierze szablony: 'folder' / 'wbudowane w .py' / 'brak'."""
+    if TEMPLATE_DIR.is_dir() and any(TEMPLATE_DIR.rglob("*")):
+        return "folder"
+    if _embedded is not None:
+        return "wbudowane w .py"
+    return "brak"
 
 
 # ---------------------------------------------------------------------------
